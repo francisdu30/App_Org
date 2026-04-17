@@ -1,27 +1,19 @@
 # =============================================================================
-#  WorkSpace Manager — Streamlit Community Cloud Edition
+#  WorkSpace Manager — Streamlit Community Cloud Edition  v2
 #  Stockage : Cloudflare R2 (boto3 / S3-compatible)
-#  Architecture : fichier unique, sections délimitées par des bandeaux
 # =============================================================================
-#
 #  Secrets requis dans .streamlit/secrets.toml :
-#    R2_ACCOUNT_ID = "..."
-#    R2_ACCESS_KEY  = "..."
-#    R2_SECRET_KEY  = "..."
-#    R2_BUCKET      = "..."
-#
-#  Structure des objets dans R2 :
-#    sessions.parquet          → annuaire utilisateurs + arborescence JSON
-#    tables/<file_id>.parquet  → tableurs
-#    maps/<file_id>.parquet    → maps brainstorming
-#
+#    R2_ACCOUNT_ID = "..."   R2_ACCESS_KEY = "..."
+#    R2_SECRET_KEY = "..."   R2_BUCKET     = "..."
+# =============================================================================
+#  Structure R2 :
+#    sessions.parquet          → {key, value} : users + arbos JSON
+#    tables/<id>.parquet       → tableurs (col _location_ cachée)
+#    maps/<id>.parquet         → maps brainstorming
 # =============================================================================
 
 from __future__ import annotations
-
-import io
-import json
-import uuid
+import io, json, uuid, hashlib
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
@@ -30,414 +22,326 @@ from botocore.exceptions import ClientError
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 1 — COUCHE R2 / STOCKAGE
+#  §1 — COUCHE R2
 # ══════════════════════════════════════════════════════════════════════════════
-
-SESSIONS_KEY = "sessions.parquet"
-SESSIONS_COLS = ["key", "value"]   # key=utilisateur ou "_meta_", value=JSON
-
 
 @st.cache_resource
 def get_r2():
-    """Connexion singleton au bucket R2."""
-    return boto3.client(
-        "s3",
+    return boto3.client("s3",
         endpoint_url=f"https://{st.secrets['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com",
         aws_access_key_id=st.secrets["R2_ACCESS_KEY"],
         aws_secret_access_key=st.secrets["R2_SECRET_KEY"],
-        region_name="auto",
-    )
+        region_name="auto")
 
+def _bkt(): return st.secrets["R2_BUCKET"]
 
-def _bucket() -> str:
-    return st.secrets["R2_BUCKET"]
-
-
-def load_parquet(key: str, cols: list[str]) -> pd.DataFrame:
-    """Charge un fichier Parquet depuis R2. Retourne un DataFrame vide si absent."""
+def r2_load(key: str, cols: list[str]) -> pd.DataFrame:
     try:
-        obj = get_r2().get_object(Bucket=_bucket(), Key=key)
+        obj = get_r2().get_object(Bucket=_bkt(), Key=key)
         return pd.read_parquet(io.BytesIO(obj["Body"].read()))
     except ClientError as e:
-        if e.response["Error"]["Code"] in ("NoSuchKey", "404"):
+        if e.response["Error"]["Code"] in ("NoSuchKey","404"):
             return pd.DataFrame(columns=cols)
         raise
     except Exception:
         return pd.DataFrame(columns=cols)
 
+def r2_save(df: pd.DataFrame, key: str):
+    buf = io.BytesIO(); df.to_parquet(buf, index=False); buf.seek(0)
+    get_r2().put_object(Bucket=_bkt(), Key=key, Body=buf.getvalue())
 
-def save_parquet(df: pd.DataFrame, key: str) -> None:
-    """Sauvegarde un DataFrame en Parquet dans R2."""
-    buf = io.BytesIO()
-    df.to_parquet(buf, index=False)
-    buf.seek(0)
-    get_r2().put_object(Bucket=_bucket(), Key=key, Body=buf.getvalue())
+def r2_delete(key: str):
+    try: get_r2().delete_object(Bucket=_bkt(), Key=key)
+    except Exception: pass
 
-
-def delete_r2_object(key: str) -> None:
-    """Supprime un objet R2 (silencieux si absent)."""
+def r2_list(prefix: str) -> list[str]:
     try:
-        get_r2().delete_object(Bucket=_bucket(), Key=key)
-    except Exception:
-        pass
-
-
-def list_r2_keys(prefix: str) -> list[str]:
-    """Liste les clés R2 avec un préfixe donné."""
-    try:
-        r2 = get_r2()
-        paginator = r2.get_paginator("list_objects_v2")
-        keys = []
-        for page in paginator.paginate(Bucket=_bucket(), Prefix=prefix):
-            for obj in page.get("Contents", []):
-                keys.append(obj["Key"])
-        return keys
-    except Exception:
-        return []
+        pag = get_r2().get_paginator("list_objects_v2")
+        return [o["Key"] for p in pag.paginate(Bucket=_bkt(),Prefix=prefix)
+                for o in p.get("Contents",[])]
+    except Exception: return []
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 2 — DATASTORE  (sessions + arborescence + tables + maps)
+#  §2 — CACHE SESSION (évite les aller-retours R2 répétés par render)
 # ══════════════════════════════════════════════════════════════════════════════
 #
-#  sessions.parquet stocke deux types de lignes :
-#    key="_users_meta_"  value=JSON {username: {created_at: ...}, ...}
-#    key="<username>"    value=JSON (arborescence de catégories)
-#
+#  Principe : on charge sessions.parquet une seule fois par "version"
+#  (hash du contenu). Toute écriture invalide le cache local.
+#  Résultat : la sidebar ne fait plus 3-4 requêtes R2 par rerun.
+
+SESSIONS_KEY = "sessions.parquet"
+SESSIONS_COLS = ["key","value"]
+
+def _sessions_cache_load() -> pd.DataFrame:
+    """Charge depuis R2 ET met en cache session_state."""
+    df = r2_load(SESSIONS_KEY, SESSIONS_COLS)
+    st.session_state._sess_cache = df
+    st.session_state._sess_dirty = False
+    return df
+
+def _sessions_get() -> pd.DataFrame:
+    """Retourne le cache ou charge depuis R2."""
+    if "_sess_cache" not in st.session_state:
+        return _sessions_cache_load()
+    return st.session_state._sess_cache
+
+def _sessions_save(df: pd.DataFrame):
+    """Sauvegarde dans R2 et met à jour le cache."""
+    r2_save(df, SESSIONS_KEY)
+    st.session_state._sess_cache = df
+
+def _sess_get_row(df: pd.DataFrame, key: str) -> str | None:
+    rows = df[df["key"]==key]
+    return rows.iloc[0]["value"] if not rows.empty else None
+
+def _sess_upsert(df: pd.DataFrame, key: str, value: str) -> pd.DataFrame:
+    if key in df["key"].values:
+        df = df.copy(); df.loc[df["key"]==key,"value"] = value
+    else:
+        df = pd.concat([df, pd.DataFrame([{"key":key,"value":value}])], ignore_index=True)
+    return df
+
+def _sess_delete(df: pd.DataFrame, key: str) -> pd.DataFrame:
+    return df[df["key"]!=key].reset_index(drop=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  §3 — DATASTORE
+# ══════════════════════════════════════════════════════════════════════════════
 
 class DataStore:
 
-    # ── Initialisation ────────────────────────────────────────────────────────
-
     def __init__(self):
-        """Crée sessions.parquet dans R2 s'il n'existe pas encore."""
         try:
-            df = load_parquet(SESSIONS_KEY, SESSIONS_COLS)
+            df = _sessions_get()
             if df.empty or "_users_meta_" not in df["key"].values:
-                self._bootstrap_sessions()
-        except Exception:
-            self._bootstrap_sessions()
+                self._bootstrap()
+        except Exception: self._bootstrap()
 
-    def _bootstrap_sessions(self):
-        df = pd.DataFrame([
-            {"key": "_users_meta_", "value": json.dumps({})},
-        ])
-        try:
-            save_parquet(df, SESSIONS_KEY)
-        except Exception:
-            pass  # Ne pas bloquer l'app si R2 est indisponible
+    def _bootstrap(self):
+        df = pd.DataFrame([{"key":"_users_meta_","value":"{}"}])
+        try: _sessions_save(df)
+        except Exception: pass
 
-    # ── Lecture / écriture brute sessions ────────────────────────────────────
-
-    def _load_sessions_df(self) -> pd.DataFrame:
-        return load_parquet(SESSIONS_KEY, SESSIONS_COLS)
-
-    def _save_sessions_df(self, df: pd.DataFrame):
-        save_parquet(df, SESSIONS_KEY)
-
-    def _get_row(self, df: pd.DataFrame, key: str) -> str | None:
-        rows = df[df["key"] == key]
-        return rows.iloc[0]["value"] if not rows.empty else None
-
-    def _upsert_row(self, df: pd.DataFrame, key: str, value: str) -> pd.DataFrame:
-        if key in df["key"].values:
-            df = df.copy()
-            df.loc[df["key"] == key, "value"] = value
-        else:
-            df = pd.concat(
-                [df, pd.DataFrame([{"key": key, "value": value}])],
-                ignore_index=True,
-            )
-        return df
-
-    def _delete_row(self, df: pd.DataFrame, key: str) -> pd.DataFrame:
-        return df[df["key"] != key].reset_index(drop=True)
-
-    # ── Utilisateurs ─────────────────────────────────────────────────────────
+    # ── Utilisateurs ──────────────────────────────────────────────────────────
 
     def get_users(self) -> list[str]:
-        df = self._load_sessions_df()
-        raw = self._get_row(df, "_users_meta_")
-        if not raw:
-            return []
-        try:
-            return list(json.loads(raw).keys())
-        except Exception:
-            return []
+        raw = _sess_get_row(_sessions_get(), "_users_meta_")
+        try: return list(json.loads(raw or "{}").keys())
+        except: return []
 
     def add_user(self, username: str) -> bool:
-        df = self._load_sessions_df()
-        raw = self._get_row(df, "_users_meta_") or "{}"
-        users = json.loads(raw)
-        if username in users:
-            return False
+        df = _sessions_get()
+        users = json.loads(_sess_get_row(df,"_users_meta_") or "{}")
+        if username in users: return False
         users[username] = {"created_at": str(pd.Timestamp.now())}
-        df = self._upsert_row(df, "_users_meta_", json.dumps(users))
-        # Initialise l'arborescence vide pour cet utilisateur
-        df = self._upsert_row(df, username, json.dumps([]))
-        self._save_sessions_df(df)
-        return True
+        df = _sess_upsert(df,"_users_meta_",json.dumps(users))
+        df = _sess_upsert(df, username, json.dumps([]))
+        _sessions_save(df); return True
 
     def remove_user(self, username: str):
-        df = self._load_sessions_df()
-        raw = self._get_row(df, "_users_meta_") or "{}"
-        users = json.loads(raw)
-        users.pop(username, None)
-        df = self._upsert_row(df, "_users_meta_", json.dumps(users))
-        df = self._delete_row(df, username)
-        self._save_sessions_df(df)
+        df = _sessions_get()
+        users = json.loads(_sess_get_row(df,"_users_meta_") or "{}")
+        users.pop(username,None)
+        df = _sess_upsert(df,"_users_meta_",json.dumps(users))
+        df = _sess_delete(df, username)
+        _sessions_save(df)
 
-    # ── Arborescence de catégories ────────────────────────────────────────────
+    # ── Arborescence ──────────────────────────────────────────────────────────
 
-    def get_category_tree(self, username: str) -> list:
-        df = self._load_sessions_df()
-        raw = self._get_row(df, username)
-        if not raw:
-            return []
-        try:
-            return json.loads(raw)
-        except Exception:
-            return []
+    def get_tree(self, username: str) -> list:
+        raw = _sess_get_row(_sessions_get(), username)
+        try: return json.loads(raw or "[]")
+        except: return []
 
-    def save_category_tree(self, username: str, tree: list):
-        df = self._load_sessions_df()
-        df = self._upsert_row(df, username, json.dumps(tree))
-        self._save_sessions_df(df)
+    def _save_tree(self, username: str, tree: list):
+        df = _sessions_get()
+        df = _sess_upsert(df, username, json.dumps(tree))
+        _sessions_save(df)
 
-    def add_category(self, username: str, name: str, parent_id: str | None = None) -> dict:
-        tree = self.get_category_tree(username)
-        new_cat = {
-            "id": uuid.uuid4().hex[:8],
-            "name": name,
-            "children": [],
-            "items": [],
-            "collapsed": False,
-        }
-        if parent_id is None:
-            tree.append(new_cat)
-        else:
-            _tree_insert(tree, parent_id, new_cat)
-        self.save_category_tree(username, tree)
-        return new_cat
+    def add_category(self, username: str, name: str, parent_id: str|None=None) -> dict:
+        tree = self.get_tree(username)
+        node = {"id":uuid.uuid4().hex[:8],"name":name,"children":[],"items":[],"collapsed":False}
+        if parent_id is None: tree.append(node)
+        else: _t_insert(tree, parent_id, node)
+        self._save_tree(username, tree); return node
 
     def delete_category(self, username: str, cat_id: str):
-        tree = self.get_category_tree(username)
-        tree = _tree_remove(tree, cat_id)
-        self.save_category_tree(username, tree)
+        tree = _t_remove(self.get_tree(username), cat_id)
+        self._save_tree(username, tree)
 
-    def rename_category(self, username: str, cat_id: str, new_name: str):
-        tree = self.get_category_tree(username)
-        _tree_rename(tree, cat_id, new_name)
-        self.save_category_tree(username, tree)
+    def rename_category(self, username: str, cat_id: str, name: str):
+        tree = self.get_tree(username)
+        _t_rename(tree, cat_id, name); self._save_tree(username, tree)
 
     def toggle_collapsed(self, username: str, cat_id: str):
-        tree = self.get_category_tree(username)
-        _tree_toggle(tree, cat_id)
-        self.save_category_tree(username, tree)
+        tree = self.get_tree(username)
+        _t_toggle(tree, cat_id); self._save_tree(username, tree)
 
-    def move_category(self, username: str, node_id: str, new_parent_id: str | None):
-        tree = self.get_category_tree(username)
-        node = _tree_find(tree, node_id)
-        if node is None:
-            return
-        if new_parent_id and _is_descendant(node, new_parent_id):
-            return  # Anti-cycle
-        tree = _tree_remove(tree, node_id)
-        if new_parent_id is None:
-            tree.append(node)
-        else:
-            _tree_insert(tree, new_parent_id, node)
-        self.save_category_tree(username, tree)
+    def move_category(self, username: str, node_id: str, new_parent: str|None):
+        tree = self.get_tree(username)
+        node = _t_find(tree, node_id)
+        if not node: return
+        if new_parent and _t_is_desc(node, new_parent): return
+        tree = _t_remove(tree, node_id)
+        if new_parent is None: tree.append(node)
+        else: _t_insert(tree, new_parent, node)
+        self._save_tree(username, tree)
 
-    # ── Items (tables/maps) dans les catégories ───────────────────────────────
+    def add_item(self, username: str, cat_id: str, item: dict):
+        tree = self.get_tree(username)
+        _t_add_item(tree, cat_id, item); self._save_tree(username, tree)
 
-    def add_item_to_category(self, username: str, cat_id: str, item: dict):
-        tree = self.get_category_tree(username)
-        _tree_add_item(tree, cat_id, item)
-        self.save_category_tree(username, tree)
+    def remove_item(self, username: str, cat_id: str, item_id: str):
+        tree = self.get_tree(username)
+        _t_del_item(tree, cat_id, item_id); self._save_tree(username, tree)
 
-    def remove_item_from_category(self, username: str, cat_id: str, item_id: str):
-        tree = self.get_category_tree(username)
-        _tree_remove_item(tree, cat_id, item_id)
-        self.save_category_tree(username, tree)
+    def get_path(self, username: str, cat_id: str) -> list[str]:
+        tree = self.get_tree(username); path=[]
+        _t_path_names(tree, cat_id, path); return path
 
-    # ── Génération d'ID unique ────────────────────────────────────────────────
+    def get_flat(self, username: str) -> list[dict]:
+        tree = self.get_tree(username); res=[]
+        _t_flatten(tree,[],res,username); return res
 
-    def generate_unique_file_id(self, prefix: str = "tbl") -> str:
-        """Génère un ID de fichier non-collisionnel en vérifiant R2."""
-        existing = set(
-            k.replace("tables/", "").replace("maps/", "").replace(".parquet", "")
-            for k in list_r2_keys("tables/") + list_r2_keys("maps/")
-        )
-        while True:
-            uid = f"{prefix}_{uuid.uuid4().hex[:10]}"
-            if uid not in existing:
-                return uid
+    # ── ID unique (sans list_r2_keys — utilise uuid v4 avec vérif légère) ──
+
+    def gen_id(self, prefix: str="tbl") -> str:
+        # uuid4 hex 16 chars → collision quasi-impossible, pas besoin de lister R2
+        return f"{prefix}_{uuid.uuid4().hex[:16]}"
 
     # ── Tables ────────────────────────────────────────────────────────────────
 
-    def create_table(self, file_id: str, breadcrumb: list[str],
-                     rows: int = 20, cols: int = 10) -> pd.DataFrame:
-        col_names = [f"Col_{chr(65 + i % 26)}{'_' + str(i // 26) if i >= 26 else ''}"
-                     for i in range(cols)]
-        data = {c: [""] * rows for c in col_names}
-        df = pd.DataFrame(data)
-        location = " > ".join(breadcrumb)
-        df.insert(0, "_location_", [location] + [""] * (rows - 1))
-        save_parquet(df, f"tables/{file_id}.parquet")
-        return df
+    def create_table(self, fid: str, bc: list[str], rows:int=20, cols:int=10) -> pd.DataFrame:
+        cnames = [f"Col_{chr(65+i%26)}{'_'+str(i//26) if i>=26 else ''}" for i in range(cols)]
+        df = pd.DataFrame({c:[""]*rows for c in cnames})
+        df.insert(0,"_location_",[" > ".join(bc)]+[""]*(rows-1))
+        r2_save(df, f"tables/{fid}.parquet"); return df
 
-    def load_table(self, file_id: str) -> pd.DataFrame | None:
-        df = load_parquet(f"tables/{file_id}.parquet", [])
-        return None if df.empty and "_location_" not in df.columns else df
+    def resize_table(self, fid: str, df: pd.DataFrame, new_rows: int, new_cols: int) -> pd.DataFrame:
+        """Redimensionne la table (ajoute/supprime lignes et colonnes)."""
+        vis = [c for c in df.columns if c!="_location_"]
+        loc = df["_location_"].copy()
+        data = df[vis].copy()
+        # Colonnes
+        cur_cols = len(vis)
+        if new_cols > cur_cols:
+            for i in range(cur_cols, new_cols):
+                cn = f"Col_{chr(65+i%26)}{'_'+str(i//26) if i>=26 else ''}"
+                data[cn] = ""
+        elif new_cols < cur_cols:
+            data = data.iloc[:, :new_cols]
+        # Lignes
+        cur_rows = len(data)
+        if new_rows > cur_rows:
+            empty = pd.DataFrame({"" if c=="_location_" else c:[""] for c in data.columns},
+                                  index=range(new_rows-cur_rows))
+            empty.columns = data.columns
+            data = pd.concat([data, empty], ignore_index=True)
+        elif new_rows < cur_rows:
+            data = data.iloc[:new_rows]
+        # Reconstruire avec _location_
+        loc_ext = loc.reindex(range(new_rows)).fillna("")
+        data.insert(0,"_location_",loc_ext.values)
+        return data
 
-    def save_table(self, file_id: str, df: pd.DataFrame):
-        save_parquet(df, f"tables/{file_id}.parquet")
+    def load_table(self, fid: str) -> pd.DataFrame|None:
+        df = r2_load(f"tables/{fid}.parquet",[])
+        return None if (df.empty and "_location_" not in df.columns) else df
 
-    def delete_table(self, file_id: str):
-        delete_r2_object(f"tables/{file_id}.parquet")
+    def save_table(self, fid: str, df: pd.DataFrame):
+        r2_save(df, f"tables/{fid}.parquet")
 
-    # ── Maps brainstorming ────────────────────────────────────────────────────
+    def del_table(self, fid: str): r2_delete(f"tables/{fid}.parquet")
 
-    def create_map(self, file_id: str, breadcrumb: list[str]) -> pd.DataFrame:
-        location = " > ".join(breadcrumb)
-        df = pd.DataFrame([{
-            "_location_": location,
-            "object_id": "_meta_",
-            "type": "meta",
-            "label": "map",
-            "coords": "{}",
-        }])
-        save_parquet(df, f"maps/{file_id}.parquet")
-        return df
+    # ── Maps ──────────────────────────────────────────────────────────────────
 
-    def load_map(self, file_id: str) -> pd.DataFrame | None:
-        cols = ["_location_", "object_id", "type", "label", "coords"]
-        df = load_parquet(f"maps/{file_id}.parquet", cols)
-        return None if df.empty and "object_id" not in df.columns else df
+    def create_map(self, fid: str, bc: list[str]) -> pd.DataFrame:
+        df = pd.DataFrame([{"_location_":" > ".join(bc),"object_id":"_meta_",
+                            "type":"meta","label":"map","coords":"{}","writable":"false"}])
+        r2_save(df, f"maps/{fid}.parquet"); return df
 
-    def save_map(self, file_id: str, df: pd.DataFrame):
-        save_parquet(df, f"maps/{file_id}.parquet")
+    def load_map(self, fid: str) -> pd.DataFrame|None:
+        cols=["_location_","object_id","type","label","coords","writable"]
+        df = r2_load(f"maps/{fid}.parquet", cols)
+        # Migration: ajouter colonne writable si absente
+        if "writable" not in df.columns: df["writable"]="true"
+        return None if (df.empty and "object_id" not in df.columns) else df
 
-    def delete_map(self, file_id: str):
-        delete_r2_object(f"maps/{file_id}.parquet")
-
-    # ── Utilitaires de navigation ─────────────────────────────────────────────
-
-    def get_category_path(self, username: str, cat_id: str) -> list[str]:
-        tree = self.get_category_tree(username)
-        path: list[str] = []
-        _find_path_names(tree, cat_id, path)
-        return path
-
-    def get_all_categories_flat(self, username: str) -> list[dict]:
-        tree = self.get_category_tree(username)
-        result: list[dict] = []
-        _flatten_tree(tree, [], result, username)
-        return result
+    def save_map(self, fid: str, df: pd.DataFrame): r2_save(df, f"maps/{fid}.parquet")
+    def del_map(self, fid: str): r2_delete(f"maps/{fid}.parquet")
 
 
-# ── Helpers récursifs pour l'arborescence (fonctions pures) ──────────────────
+# ── Helpers arbre ─────────────────────────────────────────────────────────────
 
-def _tree_insert(nodes: list, parent_id: str, new_node: dict) -> bool:
-    for n in nodes:
-        if n["id"] == parent_id:
-            n.setdefault("children", []).append(new_node)
-            return True
-        if _tree_insert(n.get("children", []), parent_id, new_node):
-            return True
+def _t_insert(ns,pid,node):
+    for n in ns:
+        if n["id"]==pid: n.setdefault("children",[]).append(node); return True
+        if _t_insert(n.get("children",[]),pid,node): return True
     return False
 
-def _tree_remove(nodes: list, node_id: str) -> list:
-    result = []
-    for n in nodes:
-        if n["id"] == node_id:
-            continue
-        n["children"] = _tree_remove(n.get("children", []), node_id)
-        result.append(n)
-    return result
+def _t_remove(ns,nid):
+    r=[]
+    for n in ns:
+        if n["id"]==nid: continue
+        n["children"]=_t_remove(n.get("children",[]),nid); r.append(n)
+    return r
 
-def _tree_rename(nodes: list, node_id: str, new_name: str) -> bool:
-    for n in nodes:
-        if n["id"] == node_id:
-            n["name"] = new_name
-            return True
-        if _tree_rename(n.get("children", []), node_id, new_name):
-            return True
+def _t_rename(ns,nid,name):
+    for n in ns:
+        if n["id"]==nid: n["name"]=name; return True
+        if _t_rename(n.get("children",[]),nid,name): return True
     return False
 
-def _tree_toggle(nodes: list, node_id: str) -> bool:
-    for n in nodes:
-        if n["id"] == node_id:
-            n["collapsed"] = not n.get("collapsed", False)
-            return True
-        if _tree_toggle(n.get("children", []), node_id):
-            return True
+def _t_toggle(ns,nid):
+    for n in ns:
+        if n["id"]==nid: n["collapsed"]=not n.get("collapsed",False); return True
+        if _t_toggle(n.get("children",[]),nid): return True
     return False
 
-def _tree_find(nodes: list, node_id: str) -> dict | None:
-    for n in nodes:
-        if n["id"] == node_id:
-            return n
-        found = _tree_find(n.get("children", []), node_id)
-        if found:
-            return found
+def _t_find(ns,nid):
+    for n in ns:
+        if n["id"]==nid: return n
+        f=_t_find(n.get("children",[]),nid)
+        if f: return f
     return None
 
-def _is_descendant(node: dict, target_id: str) -> bool:
-    for child in node.get("children", []):
-        if child["id"] == target_id or _is_descendant(child, target_id):
-            return True
+def _t_is_desc(node,tid):
+    for c in node.get("children",[]):
+        if c["id"]==tid or _t_is_desc(c,tid): return True
     return False
 
-def _tree_add_item(nodes: list, cat_id: str, item: dict) -> bool:
-    for n in nodes:
-        if n["id"] == cat_id:
-            n.setdefault("items", []).append(item)
-            return True
-        if _tree_add_item(n.get("children", []), cat_id, item):
-            return True
+def _t_add_item(ns,cid,item):
+    for n in ns:
+        if n["id"]==cid: n.setdefault("items",[]).append(item); return True
+        if _t_add_item(n.get("children",[]),cid,item): return True
     return False
 
-def _tree_remove_item(nodes: list, cat_id: str, item_id: str) -> bool:
-    for n in nodes:
-        if n["id"] == cat_id:
-            n["items"] = [i for i in n.get("items", []) if i["id"] != item_id]
-            return True
-        if _tree_remove_item(n.get("children", []), cat_id, item_id):
-            return True
+def _t_del_item(ns,cid,iid):
+    for n in ns:
+        if n["id"]==cid: n["items"]=[i for i in n.get("items",[]) if i["id"]!=iid]; return True
+        if _t_del_item(n.get("children",[]),cid,iid): return True
     return False
 
-def _find_path_names(nodes: list, target_id: str, path: list) -> bool:
-    for n in nodes:
+def _t_path_names(ns,tid,path):
+    for n in ns:
         path.append(n["name"])
-        if n["id"] == target_id:
-            return True
-        if _find_path_names(n.get("children", []), target_id, path):
-            return True
+        if n["id"]==tid: return True
+        if _t_path_names(n.get("children",[]),tid,path): return True
         path.pop()
     return False
 
-def _find_path_ids(nodes: list, target_id: str, path: list) -> bool:
-    for n in nodes:
-        path.append(n["id"])
-        if n["id"] == target_id:
-            return True
-        if _find_path_ids(n.get("children", []), target_id, path):
-            return True
-        path.pop()
-    return False
-
-def _flatten_tree(nodes: list, path: list, result: list, username: str):
-    for n in nodes:
-        cp = path + [n["name"]]
-        result.append({"id": n["id"], "name": n["name"], "path": cp,
-                        "items": n.get("items", []), "username": username})
-        _flatten_tree(n.get("children", []), cp, result, username)
+def _t_flatten(ns,path,res,user):
+    for n in ns:
+        cp=path+[n["name"]]
+        res.append({"id":n["id"],"name":n["name"],"path":cp,
+                    "items":n.get("items",[]),"username":user})
+        _t_flatten(n.get("children",[]),cp,res,user)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 3 — GESTION DU STATE STREAMLIT
+#  §4 — STATE STREAMLIT
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_ds() -> DataStore:
@@ -445,680 +349,479 @@ def get_ds() -> DataStore:
         st.session_state._ds = DataStore()
     return st.session_state._ds
 
-
 def init_state():
-    defaults: dict = {
-        "current_user": None,
-        "current_cat_id": None,
-        "current_item": None,
-        "view": "folder",           # "folder" | "table" | "map"
-        "undo_stack": [],
-        "redo_stack": [],
-        "table_df": None,
+    defs = {
+        "current_user":None, "current_cat_id":None, "current_item":None,
+        "view":"folder",
+        # Table
+        "table_df":None, "table_hash":None,
+        "undo_stack":[], "redo_stack":[],
+        "tbl_autosave":True,
+        "tbl_resize_rows":None, "tbl_resize_cols":None,
+        # Map
+        "map_autosave":True,
     }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
-    get_ds()  # Initialise le DataStore (et R2) au premier démarrage
+    for k,v in defs.items():
+        if k not in st.session_state: st.session_state[k]=v
+    get_ds()
 
-
-def set_current_user(username: str | None):
-    st.session_state.current_user = username
-    st.session_state.current_cat_id = None
-    st.session_state.current_item = None
-    st.session_state.view = "folder"
-
-
-def set_current_category(cat_id: str | None):
-    st.session_state.current_cat_id = cat_id
-    st.session_state.current_item = None
-    st.session_state.view = "folder"
-
-
-def open_item(item: dict):
-    st.session_state.current_item = item
-    st.session_state.view = item["type"]
-    st.session_state.undo_stack = []
-    st.session_state.redo_stack = []
-    st.session_state.table_df = None
-
-
-def go_back_to_folder():
-    st.session_state.current_item = None
-    st.session_state.view = "folder"
-    st.session_state.table_df = None
+def set_user(u): st.session_state.update(current_user=u,current_cat_id=None,current_item=None,view="folder")
+def set_cat(c): st.session_state.update(current_cat_id=c,current_item=None,view="folder")
+def open_item(item):
+    st.session_state.update(current_item=item,view=item["type"],
+                             undo_stack=[],redo_stack=[],table_df=None,table_hash=None)
+def go_back():
+    st.session_state.update(current_item=None,view="folder",table_df=None,table_hash=None)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 4 — CSS GLOBAL
+#  §5 — CSS
 # ══════════════════════════════════════════════════════════════════════════════
 
 CSS = """
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Syne:wght@400;600;800&display=swap');
-
-:root {
-    --bg-primary: #0f0f13;
-    --bg-secondary: #16161d;
-    --bg-card: #1c1c26;
-    --bg-hover: #22222e;
-    --accent: #6c63ff;
-    --accent-light: #8b85ff;
-    --accent-dim: rgba(108,99,255,0.15);
-    --text-primary: #e8e8f0;
-    --text-secondary: #8888aa;
-    --text-muted: #55556a;
-    --border: #2a2a3a;
-    --border-accent: rgba(108,99,255,0.4);
-    --success: #4ade80;
-    --danger: #f87171;
-}
-
-.stApp { background: var(--bg-primary) !important; font-family: 'JetBrains Mono', monospace !important; color: var(--text-primary) !important; }
-#MainMenu, footer, header { visibility: hidden; }
-.stDeployButton { display: none; }
-
-section[data-testid="stSidebar"] { background: var(--bg-secondary) !important; border-right: 1px solid var(--border) !important; }
-
-.session-header { font-family: 'Syne', sans-serif; font-weight: 800; font-size: 1.05rem; color: var(--accent-light); padding: 14px 10px 8px; border-bottom: 1px solid var(--border); letter-spacing: 0.05em; text-transform: uppercase; }
-.page-title { font-family: 'Syne', sans-serif; font-size: 1.5rem; font-weight: 800; color: var(--text-primary); margin-bottom: 18px; }
-.breadcrumb { display: flex; align-items: center; gap: 5px; font-size: 0.78rem; color: var(--text-muted); margin-bottom: 14px; }
-.bc-item { cursor: pointer; color: var(--text-secondary); padding: 2px 5px; border-radius: 3px; }
-.bc-item:hover { color: var(--accent-light); }
-.bc-item.current { color: var(--accent-light); cursor: default; }
-.bc-sep { color: var(--text-muted); }
-.user-section-header { font-family: 'Syne', sans-serif; font-size: 0.85rem; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.1em; padding: 8px 0 4px; border-bottom: 1px solid var(--border); margin: 14px 0 8px; }
-
-.stButton > button { font-family: 'JetBrains Mono', monospace !important; background: var(--bg-card) !important; color: var(--text-secondary) !important; border: 1px solid var(--border) !important; border-radius: 6px !important; transition: all 0.15s !important; font-size: 0.8rem !important; }
-.stButton > button:hover { border-color: var(--border-accent) !important; color: var(--accent-light) !important; background: var(--accent-dim) !important; }
-.stButton > button[kind="primary"] { background: var(--accent-dim) !important; color: var(--accent-light) !important; border-color: var(--border-accent) !important; }
-
-.stTextInput > div > div > input { background: var(--bg-card) !important; color: var(--text-primary) !important; border: 1px solid var(--border) !important; border-radius: 6px !important; font-family: 'JetBrains Mono', monospace !important; font-size: 0.83rem !important; }
-.stTextInput > div > div > input:focus { border-color: var(--accent) !important; box-shadow: 0 0 0 2px var(--accent-dim) !important; }
-.stNumberInput > div > div > input { background: var(--bg-card) !important; color: var(--text-primary) !important; border: 1px solid var(--border) !important; border-radius: 6px !important; font-family: 'JetBrains Mono', monospace !important; font-size: 0.83rem !important; }
-.stSelectbox > div > div { background: var(--bg-card) !important; color: var(--text-primary) !important; border: 1px solid var(--border) !important; border-radius: 6px !important; }
-.stTextArea > div > div > textarea { background: var(--bg-card) !important; color: var(--text-primary) !important; border: 1px solid var(--border) !important; border-radius: 6px !important; font-family: 'JetBrains Mono', monospace !important; font-size: 0.8rem !important; }
-.stMarkdown p { font-family: 'JetBrains Mono', monospace !important; font-size: 0.83rem !important; color: var(--text-secondary) !important; }
-div[data-testid="stHorizontalBlock"] { gap: 6px !important; }
-
-::-webkit-scrollbar { width: 4px; height: 4px; }
-::-webkit-scrollbar-track { background: var(--bg-primary); }
-::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+:root{--bg:#0f0f13;--bg2:#16161d;--bg3:#1c1c26;--bg4:#22222e;
+  --ac:#6c63ff;--acl:#8b85ff;--acd:rgba(108,99,255,.15);
+  --t1:#e8e8f0;--t2:#8888aa;--t3:#55556a;--bd:#2a2a3a;--bda:rgba(108,99,255,.4);}
+.stApp{background:var(--bg)!important;font-family:'JetBrains Mono',monospace!important;color:var(--t1)!important;}
+#MainMenu,footer,header{visibility:hidden;}.stDeployButton{display:none;}
+section[data-testid="stSidebar"]{background:var(--bg2)!important;border-right:1px solid var(--bd)!important;}
+.sh{font-family:'Syne',sans-serif;font-weight:800;font-size:1.05rem;color:var(--acl);padding:14px 10px 8px;border-bottom:1px solid var(--bd);letter-spacing:.05em;text-transform:uppercase;}
+.pt{font-family:'Syne',sans-serif;font-size:1.5rem;font-weight:800;color:var(--t1);margin-bottom:16px;}
+.bc{display:flex;align-items:center;gap:5px;font-size:.78rem;color:var(--t3);margin-bottom:12px;}
+.bci{cursor:pointer;color:var(--t2);padding:2px 5px;border-radius:3px;}.bci:hover{color:var(--acl);}
+.bci.cur{color:var(--acl);cursor:default;}.bcs{color:var(--t3);}
+.ush{font-family:'Syne',sans-serif;font-size:.85rem;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.1em;padding:8px 0 4px;border-bottom:1px solid var(--bd);margin:14px 0 8px;}
+.stButton>button{font-family:'JetBrains Mono',monospace!important;background:var(--bg3)!important;color:var(--t2)!important;border:1px solid var(--bd)!important;border-radius:6px!important;transition:all .15s!important;font-size:.8rem!important;}
+.stButton>button:hover{border-color:var(--bda)!important;color:var(--acl)!important;background:var(--acd)!important;}
+.stButton>button[kind="primary"]{background:var(--acd)!important;color:var(--acl)!important;border-color:var(--bda)!important;}
+.stTextInput>div>div>input{background:var(--bg3)!important;color:var(--t1)!important;border:1px solid var(--bd)!important;border-radius:6px!important;font-family:'JetBrains Mono',monospace!important;font-size:.83rem!important;}
+.stTextInput>div>div>input:focus{border-color:var(--ac)!important;box-shadow:0 0 0 2px var(--acd)!important;}
+.stNumberInput>div>div>input{background:var(--bg3)!important;color:var(--t1)!important;border:1px solid var(--bd)!important;border-radius:6px!important;font-family:'JetBrains Mono',monospace!important;font-size:.83rem!important;}
+.stSelectbox>div>div{background:var(--bg3)!important;color:var(--t1)!important;border:1px solid var(--bd)!important;border-radius:6px!important;}
+.stTextArea>div>div>textarea{background:var(--bg3)!important;color:var(--t1)!important;border:1px solid var(--bd)!important;border-radius:6px!important;font-family:'JetBrains Mono',monospace!important;font-size:.8rem!important;}
+.stMarkdown p{font-family:'JetBrains Mono',monospace!important;font-size:.83rem!important;color:var(--t2)!important;}
+div[data-testid="stHorizontalBlock"]{gap:5px!important;}
+::-webkit-scrollbar{width:4px;height:4px;}::-webkit-scrollbar-track{background:var(--bg);}::-webkit-scrollbar-thumb{background:var(--bd);border-radius:3px;}
+.toggle-as{display:flex;align-items:center;gap:8px;font-size:.75rem;color:var(--t2);padding:4px 0;}
 """
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 5 — BARRE LATÉRALE
+#  §6 — SIDEBAR
 # ══════════════════════════════════════════════════════════════════════════════
 
 def render_sidebar():
     ds = get_ds()
+    # Une seule lecture R2 (cache session_state)
     users = ds.get_users()
-    current_user = st.session_state.get("current_user")
+    cu = st.session_state.get("current_user")
 
-    st.markdown('<div class="session-header">⬡ Sessions</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sh">⬡ Sessions</div>', unsafe_allow_html=True)
 
-    # Bouton "Toutes les sessions"
-    if st.button("🌐 Toutes les sessions", key="btn_all_sessions",
-                 type="primary" if current_user is None else "secondary",
-                 use_container_width=True):
-        set_current_user(None)
-        st.rerun()
+    if st.button("🌐 Toutes les sessions", key="btn_all",
+                 type="primary" if cu is None else "secondary", use_container_width=True):
+        set_user(None); st.rerun()
 
-    # Boutons utilisateurs
     for user in users:
-        if st.button(f"👤 {user}", key=f"btn_user_{user}",
-                     type="primary" if current_user == user else "secondary",
-                     use_container_width=True):
-            set_current_user(user)
-            st.rerun()
+        if st.button(f"👤 {user}", key=f"bu_{user}",
+                     type="primary" if cu==user else "secondary", use_container_width=True):
+            set_user(user); st.rerun()
 
     st.divider()
-
-    # Créer une nouvelle session
     with st.expander("➕ Nouvelle session"):
-        new_user = st.text_input("Nom", key="new_user_input",
-                                 label_visibility="collapsed",
-                                 placeholder="Nom d'utilisateur...")
-        if st.button("Créer", key="btn_create_user", use_container_width=True):
-            if new_user.strip():
-                if ds.add_user(new_user.strip()):
-                    set_current_user(new_user.strip())
-                    st.success(f"Session '{new_user}' créée !")
-                    st.rerun()
-                else:
-                    st.error("Ce nom existe déjà.")
+        nu = st.text_input("Nom", key="nu_input", label_visibility="collapsed", placeholder="Nom d'utilisateur...")
+        if st.button("Créer", key="btn_nu", use_container_width=True):
+            if nu.strip():
+                if ds.add_user(nu.strip()): set_user(nu.strip()); st.rerun()
+                else: st.error("Nom déjà utilisé.")
 
-    # Arborescence de catégories
-    if current_user:
-        st.markdown(
-            '<div style="padding:8px 0 4px;font-size:0.72rem;color:#6c63ff;'
-            'text-transform:uppercase;letter-spacing:0.1em;">📁 Arborescence</div>',
-            unsafe_allow_html=True,
-        )
-        _render_nodes(ds, current_user, ds.get_category_tree(current_user), depth=0)
-
+    if cu:
+        st.markdown('<div style="padding:8px 0 4px;font-size:.72rem;color:#6c63ff;text-transform:uppercase;letter-spacing:.1em;">📁 Arborescence</div>', unsafe_allow_html=True)
+        # Lecture arbre depuis cache (pas de R2 supplémentaire)
+        _render_nodes(ds, cu, ds.get_tree(cu), 0)
         st.divider()
         with st.expander("➕ Catégorie racine"):
-            cat_name = st.text_input("Nom", key="new_root_cat",
-                                     label_visibility="collapsed",
-                                     placeholder="Nom de catégorie...")
-            if st.button("Créer", key="btn_create_root_cat", use_container_width=True):
-                if cat_name.strip():
-                    ds.add_category(current_user, cat_name.strip())
-                    st.rerun()
-
+            cn = st.text_input("Nom", key="new_cat", label_visibility="collapsed", placeholder="Nom de catégorie...")
+            if st.button("Créer", key="btn_nc", use_container_width=True):
+                if cn.strip(): ds.add_category(cu, cn.strip()); st.rerun()
         st.divider()
         with st.expander("⚠️ Supprimer session"):
-            st.warning(f"Supprimer « {current_user} » ?")
-            if st.button("Confirmer", key="btn_del_user", type="primary"):
-                ds.remove_user(current_user)
-                set_current_user(None)
-                st.rerun()
+            st.warning(f"Supprimer « {cu} » ?")
+            if st.button("Confirmer", key="btn_du", type="primary"):
+                ds.remove_user(cu); set_user(None); st.rerun()
 
 
-def _render_nodes(ds: DataStore, username: str, nodes: list,
-                  depth: int, max_depth: int = 1):
-    """Rendu récursif de l'arborescence (2 niveaux max visibles)."""
-    current_cat = st.session_state.get("current_cat_id")
-
-    for node in nodes:
-        node_id = node["id"]
-        name = node["name"]
-        children = node.get("children", [])
-        collapsed = node.get("collapsed", False)
-        has_children = bool(children)
-        is_selected = current_cat == node_id
-        icon = "📁" if has_children else "📂"
-
-        col1, col2, col3 = st.columns([0.14, 0.65, 0.21])
-
-        with col1:
-            if has_children and depth < max_depth:
-                label = "▶" if collapsed else "▼"
-                if st.button(label, key=f"toggle_{node_id}", help="Plier/déplier"):
-                    ds.toggle_collapsed(username, node_id)
-                    st.rerun()
-
-        with col2:
-            prefix = "   " * depth
-            display = f"{prefix}{icon} {name}"
-            if st.button(display, key=f"cat_{node_id}",
-                         type="primary" if is_selected else "secondary",
-                         use_container_width=True):
-                set_current_category(node_id)
-                st.rerun()
-
-        with col3:
+def _render_nodes(ds, user, nodes, depth, max_depth=1):
+    cc = st.session_state.get("current_cat_id")
+    for n in nodes:
+        nid,name = n["id"],n["name"]
+        kids = n.get("children",[])
+        collapsed = n.get("collapsed",False)
+        sel = cc==nid
+        icon = "📁" if kids else "📂"
+        c1,c2,c3 = st.columns([.13,.66,.21])
+        with c1:
+            if kids and depth<max_depth:
+                lbl = "▶" if collapsed else "▼"
+                if st.button(lbl, key=f"tgl_{nid}", help="Plier/déplier"):
+                    ds.toggle_collapsed(user,nid); st.rerun()
+        with c2:
+            pref = "   "*depth
+            if st.button(f"{pref}{icon} {name}", key=f"cat_{nid}",
+                         type="primary" if sel else "secondary", use_container_width=True):
+                set_cat(nid); st.rerun()
+        with c3:
             with st.popover("⋯"):
-                # Ajouter une sous-catégorie
-                sub = st.text_input("Sous-cat.", key=f"sub_{node_id}",
-                                    placeholder="Nom...", label_visibility="collapsed")
-                if st.button("➕ Ajouter", key=f"addsub_{node_id}"):
-                    if sub.strip():
-                        ds.add_category(username, sub.strip(), parent_id=node_id)
-                        st.rerun()
-
-                # Renommer
-                new_name = st.text_input("Renommer", key=f"ren_{node_id}",
-                                         value=name, label_visibility="collapsed")
-                if st.button("✏️ Renommer", key=f"doRen_{node_id}"):
-                    if new_name.strip() and new_name.strip() != name:
-                        ds.rename_category(username, node_id, new_name.strip())
-                        st.rerun()
-
-                # Déplacer
-                all_cats = ds.get_all_categories_flat(username)
-                opts = {c["name"]: c["id"] for c in all_cats if c["id"] != node_id}
-                opts["(Racine)"] = None
-                target = st.selectbox("Déplacer vers", list(opts.keys()),
-                                      key=f"mv_{node_id}")
-                if st.button("↗️ Déplacer", key=f"doMv_{node_id}"):
-                    ds.move_category(username, node_id, opts[target])
-                    st.rerun()
-
+                sub=st.text_input("Sous-cat.",key=f"sub_{nid}",placeholder="Nom...",label_visibility="collapsed")
+                if st.button("➕",key=f"addsub_{nid}"):
+                    if sub.strip(): ds.add_category(user,sub.strip(),parent_id=nid); st.rerun()
+                nn=st.text_input("Renommer",key=f"ren_{nid}",value=name,label_visibility="collapsed")
+                if st.button("✏️",key=f"doRen_{nid}"):
+                    if nn.strip() and nn!=name: ds.rename_category(user,nid,nn.strip()); st.rerun()
+                flat=ds.get_flat(user)
+                opts={c["name"]:c["id"] for c in flat if c["id"]!=nid}; opts["(Racine)"]=None
+                tgt=st.selectbox("Déplacer vers",list(opts.keys()),key=f"mv_{nid}")
+                if st.button("↗️",key=f"doMv_{nid}"):
+                    ds.move_category(user,nid,opts[tgt]); st.rerun()
                 st.divider()
-                if st.button("🗑️ Supprimer", key=f"del_{node_id}", type="primary"):
-                    ds.delete_category(username, node_id)
-                    if current_cat == node_id:
-                        set_current_category(None)
+                if st.button("🗑️ Supprimer",key=f"del_{nid}",type="primary"):
+                    ds.delete_category(user,nid)
+                    if cc==nid: set_cat(None)
                     st.rerun()
-
-        # Enfants (max 2 niveaux visibles)
-        if has_children and not collapsed and depth < max_depth:
-            _render_nodes(ds, username, children, depth + 1, max_depth)
+        if kids and not collapsed and depth<max_depth:
+            _render_nodes(ds,user,kids,depth+1,max_depth)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 6 — VUE TOUTES LES SESSIONS
+#  §7 — VUE TOUTES SESSIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def render_all_sessions():
-    ds = get_ds()
-    users = ds.get_users()
-
-    st.markdown('<div class="page-title">🌐 Toutes les sessions</div>',
-                unsafe_allow_html=True)
-
-    if not users:
-        st.info("Aucune session créée. Ajoutez des utilisateurs depuis la barre latérale.")
-        return
-
+    ds=get_ds(); users=ds.get_users()
+    st.markdown('<div class="pt">🌐 Toutes les sessions</div>', unsafe_allow_html=True)
+    if not users: st.info("Aucune session. Créez-en une depuis la barre latérale."); return
     for user in users:
-        st.markdown(f'<div class="user-section-header">👤 {user}</div>',
-                    unsafe_allow_html=True)
-        tree = ds.get_category_tree(user)
+        st.markdown(f'<div class="ush">👤 {user}</div>', unsafe_allow_html=True)
+        tree=ds.get_tree(user)
         if not tree:
-            st.markdown('<p style="color:#55556a;font-size:0.8rem;padding-left:6px;">Aucune catégorie</p>',
-                        unsafe_allow_html=True)
-        else:
-            _render_all_sessions_categories(ds, user, tree, depth=0)
+            st.markdown('<p style="color:#55556a;font-size:.8rem;padding-left:6px;">Aucune catégorie</p>', unsafe_allow_html=True)
+        else: _render_all_cats(ds,user,tree,0)
+        if st.button(f"→ Ouvrir session {user}",key=f"oas_{user}"):
+            set_user(user); st.rerun()
+        st.markdown("<br>",unsafe_allow_html=True)
 
-        if st.button(f"→ Ouvrir session {user}", key=f"open_all_{user}"):
-            set_current_user(user)
-            st.rerun()
-        st.markdown("<br>", unsafe_allow_html=True)
-
-
-def _render_all_sessions_categories(ds: DataStore, user: str, nodes: list, depth: int):
-    for node in nodes:
-        items_count = len(node.get("items", []))
-        child_count = len(node.get("children", []))
-        prefix = "　" * depth
-        col_n, col_m, col_o = st.columns([0.55, 0.25, 0.2])
-        with col_n:
-            icon = "📁" if child_count else "📂"
-            st.markdown(
-                f'<span style="font-size:0.83rem;color:#8888aa;">{prefix}{icon} <b>{node["name"]}</b></span>',
-                unsafe_allow_html=True,
-            )
-        with col_m:
-            if items_count or child_count:
-                st.markdown(
-                    f'<span style="font-size:0.7rem;color:#6c63ff;">'
-                    f'{items_count} fich. · {child_count} ss-cat.</span>',
-                    unsafe_allow_html=True,
-                )
-        with col_o:
-            if st.button("Ouvrir", key=f"opencat_{user}_{node['id']}"):
-                set_current_user(user)
-                set_current_category(node["id"])
-                st.rerun()
-
-        if depth == 0 and node.get("children"):
-            _render_all_sessions_categories(ds, user, node["children"], depth=1)
+def _render_all_cats(ds,user,nodes,depth):
+    for n in nodes:
+        ni=len(n.get("items",[])); nc=len(n.get("children",[]))
+        pre="　"*depth; icon="📁" if nc else "📂"
+        ca,cb,cc=st.columns([.55,.25,.2])
+        with ca: st.markdown(f'<span style="font-size:.83rem;color:#8888aa;">{pre}{icon} <b>{n["name"]}</b></span>',unsafe_allow_html=True)
+        with cb:
+            if ni or nc: st.markdown(f'<span style="font-size:.7rem;color:#6c63ff;">{ni} fich.·{nc} ss-cat.</span>',unsafe_allow_html=True)
+        with cc:
+            if st.button("Ouvrir",key=f"oac_{user}_{n['id']}"):
+                set_user(user); set_cat(n["id"]); st.rerun()
+        if depth==0 and n.get("children"): _render_all_cats(ds,user,n["children"],1)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 7 — VUE DOSSIER
+#  §8 — VUE DOSSIER
 # ══════════════════════════════════════════════════════════════════════════════
 
 def render_folder():
-    ds = get_ds()
-    user = st.session_state.current_user
-    cat_id = st.session_state.get("current_cat_id")
-
-    # Breadcrumb
-    _render_breadcrumb(ds, user, cat_id)
-
+    ds=get_ds(); user=st.session_state.current_user
+    cat_id=st.session_state.get("current_cat_id")
+    _render_bc(ds,user,cat_id)
     if cat_id is None:
-        st.markdown('<div class="page-title">🏠 Accueil</div>', unsafe_allow_html=True)
-        st.info("Sélectionnez ou créez une catégorie dans la barre latérale.")
-        return
+        st.markdown('<div class="pt">🏠 Accueil</div>',unsafe_allow_html=True)
+        st.info("Sélectionnez ou créez une catégorie dans la barre latérale."); return
+    node=_t_find(ds.get_tree(user),cat_id)
+    if node is None: st.warning("Catégorie introuvable."); set_cat(None); st.rerun(); return
+    st.markdown(f'<div class="pt">📁 {node["name"]}</div>',unsafe_allow_html=True)
 
-    node = _tree_find(ds.get_category_tree(user), cat_id)
-    if node is None:
-        st.warning("Catégorie introuvable.")
-        set_current_category(None)
-        st.rerun()
-        return
-
-    st.markdown(f'<div class="page-title">📁 {node["name"]}</div>', unsafe_allow_html=True)
-
-    # Barre d'outils
-    c1, c2, c3, _ = st.columns([1, 1, 1, 3])
+    c1,c2,c3,_=st.columns([1,1,1,3])
     with c1:
-        if st.button("➕ Dossier", use_container_width=True):
-            st.session_state._show_new = "folder"
+        if st.button("➕ Dossier",use_container_width=True): st.session_state._show_new="folder"
     with c2:
-        if st.button("📊 Table", use_container_width=True):
-            st.session_state._show_new = "table"
+        if st.button("📊 Table",use_container_width=True): st.session_state._show_new="table"
     with c3:
-        if st.button("🧠 Map", use_container_width=True):
-            st.session_state._show_new = "map"
+        if st.button("🧠 Map",use_container_width=True): st.session_state._show_new="map"
 
-    # Dialogs de création
-    show = st.session_state.get("_show_new")
-    if show == "folder":
+    show=st.session_state.get("_show_new")
+    if show=="folder":
         with st.container(border=True):
             st.markdown("**➕ Nouveau sous-dossier**")
-            fname = st.text_input("Nom", key="new_folder_name", placeholder="Nom...")
-            ca, cb = st.columns(2)
-            with ca:
-                if st.button("Créer", key="confirm_folder", use_container_width=True):
-                    if fname.strip():
-                        ds.add_category(user, fname.strip(), parent_id=cat_id)
-                        st.session_state._show_new = None
-                        st.rerun()
-            with cb:
-                if st.button("Annuler", key="cancel_folder", use_container_width=True):
-                    st.session_state._show_new = None
-                    st.rerun()
-
-    elif show == "table":
+            fn=st.text_input("Nom",key="nfn",placeholder="Nom...")
+            a,b=st.columns(2)
+            with a:
+                if st.button("Créer",key="cfn",use_container_width=True):
+                    if fn.strip(): ds.add_category(user,fn.strip(),parent_id=cat_id); st.session_state._show_new=None; st.rerun()
+            with b:
+                if st.button("Annuler",key="xfn",use_container_width=True): st.session_state._show_new=None; st.rerun()
+    elif show=="table":
         with st.container(border=True):
             st.markdown("**📊 Nouvelle table**")
-            tname = st.text_input("Nom", key="new_tbl_name", placeholder="Nom...")
-            tc, tr = st.columns(2)
-            with tc:
-                tcols = st.number_input("Colonnes", 1, 50, 10, key="new_tbl_cols")
-            with tr:
-                trows = st.number_input("Lignes", 1, 500, 20, key="new_tbl_rows")
-            ca, cb = st.columns(2)
-            with ca:
-                if st.button("Créer", key="confirm_tbl", use_container_width=True):
-                    if tname.strip():
-                        _create_table(ds, user, cat_id, tname.strip(), int(tcols), int(trows))
-                        st.session_state._show_new = None
-                        st.rerun()
-            with cb:
-                if st.button("Annuler", key="cancel_tbl", use_container_width=True):
-                    st.session_state._show_new = None
-                    st.rerun()
-
-    elif show == "map":
+            tn=st.text_input("Nom",key="ntn",placeholder="Nom...")
+            tc,tr=st.columns(2)
+            with tc: tcols=st.number_input("Colonnes",1,100,10,key="ntc")
+            with tr: trows=st.number_input("Lignes",1,1000,20,key="ntr")
+            a,b=st.columns(2)
+            with a:
+                if st.button("Créer",key="ctn",use_container_width=True):
+                    if tn.strip(): _do_create_table(ds,user,cat_id,tn.strip(),int(tcols),int(trows)); st.session_state._show_new=None; st.rerun()
+            with b:
+                if st.button("Annuler",key="xtn",use_container_width=True): st.session_state._show_new=None; st.rerun()
+    elif show=="map":
         with st.container(border=True):
             st.markdown("**🧠 Nouvelle map**")
-            mname = st.text_input("Nom", key="new_map_name", placeholder="Nom...")
-            ca, cb = st.columns(2)
-            with ca:
-                if st.button("Créer", key="confirm_map", use_container_width=True):
-                    if mname.strip():
-                        _create_map(ds, user, cat_id, mname.strip())
-                        st.session_state._show_new = None
-                        st.rerun()
-            with cb:
-                if st.button("Annuler", key="cancel_map", use_container_width=True):
-                    st.session_state._show_new = None
-                    st.rerun()
+            mn=st.text_input("Nom",key="nmn",placeholder="Nom...")
+            a,b=st.columns(2)
+            with a:
+                if st.button("Créer",key="cmn",use_container_width=True):
+                    if mn.strip(): _do_create_map(ds,user,cat_id,mn.strip()); st.session_state._show_new=None; st.rerun()
+            with b:
+                if st.button("Annuler",key="xmn",use_container_width=True): st.session_state._show_new=None; st.rerun()
 
     st.markdown("---")
-
-    # Sous-dossiers
-    children = node.get("children", [])
-    if children:
-        st.markdown('<span style="font-size:0.72rem;color:#6c63ff;text-transform:uppercase;'
-                    'letter-spacing:0.1em;">📁 Sous-dossiers</span>', unsafe_allow_html=True)
-        cols = st.columns(min(len(children), 4))
-        for i, child in enumerate(children):
-            with cols[i % 4]:
-                ni = len(child.get("items", []))
-                nc = len(child.get("children", []))
+    kids=node.get("children",[])
+    if kids:
+        st.markdown('<span style="font-size:.72rem;color:#6c63ff;text-transform:uppercase;letter-spacing:.1em;">📁 Sous-dossiers</span>',unsafe_allow_html=True)
+        cols=st.columns(min(len(kids),4))
+        for i,ch in enumerate(kids):
+            with cols[i%4]:
                 with st.container(border=True):
-                    st.markdown(f"**📁 {child['name']}**")
-                    st.markdown(
-                        f'<span style="font-size:0.7rem;color:#8888aa;">'
-                        f'{ni} fichiers · {nc} sous-doss.</span>',
-                        unsafe_allow_html=True,
-                    )
-                    if st.button("Ouvrir", key=f"open_child_{child['id']}", use_container_width=True):
-                        set_current_category(child["id"])
-                        st.rerun()
-        st.markdown("<br>", unsafe_allow_html=True)
+                    st.markdown(f"**📁 {ch['name']}**")
+                    st.markdown(f'<span style="font-size:.7rem;color:#8888aa;">{len(ch.get("items",[]))} fich.·{len(ch.get("children",[]))} ss.</span>',unsafe_allow_html=True)
+                    if st.button("Ouvrir",key=f"okid_{ch['id']}",use_container_width=True):
+                        set_cat(ch["id"]); st.rerun()
+        st.markdown("<br>",unsafe_allow_html=True)
 
-    # Fichiers (tables + maps)
-    items = node.get("items", [])
+    items=node.get("items",[])
     if items:
-        st.markdown('<span style="font-size:0.72rem;color:#6c63ff;text-transform:uppercase;'
-                    'letter-spacing:0.1em;">📄 Fichiers</span>', unsafe_allow_html=True)
-        cols = st.columns(min(len(items), 4))
-        for i, item in enumerate(items):
-            with cols[i % 4]:
-                icon = "📊" if item["type"] == "table" else "🧠"
-                badge = "TABLE" if item["type"] == "table" else "MAP"
+        st.markdown('<span style="font-size:.72rem;color:#6c63ff;text-transform:uppercase;letter-spacing:.1em;">📄 Fichiers</span>',unsafe_allow_html=True)
+        cols=st.columns(min(len(items),4))
+        for i,it in enumerate(items):
+            with cols[i%4]:
+                icon="📊" if it["type"]=="table" else "🧠"
                 with st.container(border=True):
-                    st.markdown(f'**{icon} {item["name"]}**')
-                    st.markdown(
-                        f'<span style="font-size:0.67rem;color:#6c63ff;">{badge}</span>',
-                        unsafe_allow_html=True,
-                    )
-                    ca, cb = st.columns(2)
-                    with ca:
-                        if st.button("Ouvrir", key=f"open_item_{item['id']}", use_container_width=True):
-                            open_item(item)
-                            st.rerun()
-                    with cb:
-                        if st.button("🗑️", key=f"del_item_{item['id']}", use_container_width=True):
-                            _delete_item(ds, user, cat_id, item)
+                    st.markdown(f'**{icon} {it["name"]}**')
+                    st.markdown(f'<span style="font-size:.67rem;color:#6c63ff;">{"TABLE" if it["type"]=="table" else "MAP"}</span>',unsafe_allow_html=True)
+                    a,b=st.columns(2)
+                    with a:
+                        if st.button("Ouvrir",key=f"oit_{it['id']}",use_container_width=True):
+                            open_item(it); st.rerun()
+                    with b:
+                        if st.button("🗑️",key=f"dit_{it['id']}",use_container_width=True):
+                            ds.remove_item(user,cat_id,it["id"])
+                            (ds.del_table if it["type"]=="table" else ds.del_map)(it["file_id"])
                             st.rerun()
 
-    if not children and not items:
-        st.markdown(
-            '<p style="color:#55556a;font-size:0.85rem;margin-top:18px;">'
-            "Dossier vide. Utilisez la barre d'outils pour créer des éléments.</p>",
-            unsafe_allow_html=True,
-        )
+    if not kids and not items:
+        st.markdown('<p style="color:#55556a;font-size:.85rem;margin-top:16px;">Dossier vide.</p>',unsafe_allow_html=True)
 
 
-def _render_breadcrumb(ds: DataStore, user: str, cat_id: str | None):
-    path = ds.get_category_path(user, cat_id) if cat_id else []
-    parts = ["🏠 Accueil"] + path
-    html = '<div class="breadcrumb">'
-    for i, p in enumerate(parts):
-        cls = "bc-item current" if i == len(parts) - 1 else "bc-item"
-        html += f'<span class="{cls}">{p}</span>'
-        if i < len(parts) - 1:
-            html += '<span class="bc-sep">›</span>'
-    html += "</div>"
-    st.markdown(html, unsafe_allow_html=True)
-
+def _render_bc(ds,user,cat_id):
+    path=ds.get_path(user,cat_id) if cat_id else []
+    parts=["🏠 Accueil"]+path
+    html='<div class="bc">'
+    for i,p in enumerate(parts):
+        cls="bci cur" if i==len(parts)-1 else "bci"
+        html+=f'<span class="{cls}">{p}</span>'
+        if i<len(parts)-1: html+='<span class="bcs">›</span>'
+    html+="</div>"; st.markdown(html,unsafe_allow_html=True)
     if path:
-        if st.button("🏠", key="bc_home", help="Retour à l'accueil"):
-            set_current_category(None)
-            st.rerun()
+        if st.button("🏠",key="bc_home",help="Accueil"): set_cat(None); st.rerun()
 
+def _do_create_table(ds,user,cat_id,name,cols,rows):
+    bc=[user]+ds.get_path(user,cat_id); fid=ds.gen_id("tbl")
+    ds.create_table(fid,bc,rows,cols)
+    ds.add_item(user,cat_id,{"id":fid,"name":name,"type":"table","file_id":fid})
 
-def _create_table(ds: DataStore, user: str, cat_id: str, name: str, cols: int, rows: int):
-    bc = [user] + ds.get_category_path(user, cat_id)
-    file_id = ds.generate_unique_file_id("tbl")
-    ds.create_table(file_id, bc, rows=rows, cols=cols)
-    ds.add_item_to_category(user, cat_id, {"id": file_id, "name": name, "type": "table", "file_id": file_id})
-
-
-def _create_map(ds: DataStore, user: str, cat_id: str, name: str):
-    bc = [user] + ds.get_category_path(user, cat_id)
-    file_id = ds.generate_unique_file_id("map")
-    ds.create_map(file_id, bc)
-    ds.add_item_to_category(user, cat_id, {"id": file_id, "name": name, "type": "map", "file_id": file_id})
-
-
-def _delete_item(ds: DataStore, user: str, cat_id: str, item: dict):
-    ds.remove_item_from_category(user, cat_id, item["id"])
-    if item["type"] == "table":
-        ds.delete_table(item["file_id"])
-    else:
-        ds.delete_map(item["file_id"])
+def _do_create_map(ds,user,cat_id,name):
+    bc=[user]+ds.get_path(user,cat_id); fid=ds.gen_id("map")
+    ds.create_map(fid,bc)
+    ds.add_item(user,cat_id,{"id":fid,"name":name,"type":"map","file_id":fid})
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 8 — VUE TABLEUR
+#  §9 — VUE TABLEUR  (fix effacement, resize, autosave)
 # ══════════════════════════════════════════════════════════════════════════════
+#
+#  CORRECTIF EFFACEMENT :
+#  Le bug venait du fait que `data_editor` retourne les données AVANT que
+#  st.session_state.table_df soit mis à jour, causant une boucle.
+#  Solution : on compare avec un hash du DataFrame courant. Si le hash
+#  ne change pas entre deux reruns, on n'écrase pas.
+#  On ne sauvegarde dans R2 que si autosave=True OU bouton manuel.
 
 def render_table():
-    ds = get_ds()
-    item = st.session_state.get("current_item")
-    if not item:
-        go_back_to_folder()
-        st.rerun()
-        return
+    ds=get_ds()
+    item=st.session_state.get("current_item")
+    if not item: go_back(); st.rerun(); return
+    fid=item["file_id"]
 
-    file_id = item["file_id"]
-
-    # Chargement initial dans le state
+    # Chargement initial (une seule fois par ouverture)
     if st.session_state.table_df is None:
-        df = ds.load_table(file_id)
-        if df is None or df.empty:
-            st.error("Table introuvable dans R2.")
-            go_back_to_folder()
-            st.rerun()
-            return
-        st.session_state.table_df = df
-        st.session_state.undo_stack = []
-        st.session_state.redo_stack = []
+        df=ds.load_table(fid)
+        if df is None or df.empty: st.error("Table introuvable."); go_back(); st.rerun(); return
+        st.session_state.table_df=df
+        st.session_state.table_hash=_df_hash(df)
+        st.session_state.undo_stack=[]; st.session_state.redo_stack=[]
 
     df: pd.DataFrame = st.session_state.table_df
-    visible_cols = [c for c in df.columns if c != "_location_"]
-    visible_df = df[visible_cols].copy()
+    vis=[c for c in df.columns if c!="_location_"]
 
-    # En-tête
-    cb, ct, _ = st.columns([0.14, 0.6, 0.26])
+    # ── En-tête ───────────────────────────────────────────────────────────────
+    cb,ct,_=st.columns([.13,.6,.27])
     with cb:
-        if st.button("← Retour", key="tbl_back", use_container_width=True):
-            ds.save_table(file_id, st.session_state.table_df)
-            go_back_to_folder()
-            st.rerun()
+        if st.button("← Retour",key="tb_back",use_container_width=True):
+            ds.save_table(fid,st.session_state.table_df); go_back(); st.rerun()
     with ct:
-        st.markdown(f'<div class="page-title">📊 {item["name"]}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="pt">📊 {item["name"]}</div>',unsafe_allow_html=True)
 
-    # Barre d'outils
-    can_undo = bool(st.session_state.undo_stack)
-    can_redo = bool(st.session_state.redo_stack)
-    cu, cr, cs, car, cac, _ = st.columns([0.12, 0.12, 0.11, 0.13, 0.14, 0.38])
-
+    # ── Barre d'outils ────────────────────────────────────────────────────────
+    can_undo=bool(st.session_state.undo_stack); can_redo=bool(st.session_state.redo_stack)
+    cu,cr,cs,cas,_=st.columns([.1,.1,.1,.3,.4])
     with cu:
-        if st.button("↩ Annuler", key="tbl_undo", disabled=not can_undo,
-                     help=f"Annuler ({len(st.session_state.undo_stack)})",
-                     use_container_width=True):
-            _tbl_undo(ds, file_id)
-            st.rerun()
+        if st.button("↩",key="tu",disabled=not can_undo,
+                     help=f"Annuler ({len(st.session_state.undo_stack)})",use_container_width=True):
+            _tundo(ds,fid); st.rerun()
     with cr:
-        if st.button("↪ Rétablir", key="tbl_redo", disabled=not can_redo,
-                     help=f"Rétablir ({len(st.session_state.redo_stack)})",
-                     use_container_width=True):
-            _tbl_redo(ds, file_id)
-            st.rerun()
+        if st.button("↪",key="tr",disabled=not can_redo,
+                     help=f"Rétablir ({len(st.session_state.redo_stack)})",use_container_width=True):
+            _tredo(ds,fid); st.rerun()
     with cs:
-        if st.button("💾 Sauv.", key="tbl_save", use_container_width=True):
-            ds.save_table(file_id, st.session_state.table_df)
-            st.toast("Sauvegardé dans R2 ✓", icon="✅")
-    with car:
-        if st.button("+ Ligne", key="tbl_addrow", use_container_width=True):
-            _tbl_push_undo()
-            new_row = pd.DataFrame({c: [""] for c in df.columns})
-            st.session_state.table_df = pd.concat(
-                [st.session_state.table_df, new_row], ignore_index=True)
-            st.session_state.redo_stack = []
-            st.rerun()
-    with cac:
-        if st.button("+ Colonne", key="tbl_addcol", use_container_width=True):
-            _tbl_push_undo()
-            cur = st.session_state.table_df
-            idx = len([c for c in cur.columns if c != "_location_"])
-            cname = f"Col_{chr(65 + idx % 26)}{'_' + str(idx // 26) if idx >= 26 else ''}"
-            st.session_state.table_df[cname] = ""
-            st.session_state.redo_stack = []
-            st.rerun()
+        if st.button("💾",key="ts",help="Sauvegarder maintenant",use_container_width=True):
+            ds.save_table(fid,st.session_state.table_df); st.toast("Sauvegardé ✓",icon="✅")
+    with cas:
+        autosave=st.toggle("Sauvegarde auto",value=st.session_state.tbl_autosave,key="tgl_as_tbl")
+        st.session_state.tbl_autosave=autosave
+
+    # ── Redimensionnement ─────────────────────────────────────────────────────
+    with st.expander("⚙️ Redimensionner la table"):
+        cr2,cc2,cb2=st.columns([.35,.35,.3])
+        with cr2: new_rows=st.number_input("Lignes",1,2000,len(df),key="rsz_rows")
+        with cc2: new_cols=st.number_input("Colonnes",1,200,len(vis),key="rsz_cols")
+        with cb2:
+            st.markdown("<br>",unsafe_allow_html=True)
+            if st.button("Appliquer",key="rsz_apply",use_container_width=True):
+                _tpush_undo()
+                new_df=ds.resize_table(fid,st.session_state.table_df,int(new_rows),int(new_cols))
+                st.session_state.table_df=new_df
+                st.session_state.table_hash=_df_hash(new_df)
+                st.session_state.redo_stack=[]
+                if st.session_state.tbl_autosave: ds.save_table(fid,new_df)
+                st.rerun()
 
     st.markdown("---")
-    st.markdown(
-        '<span style="font-size:0.7rem;color:#55556a;">'
-        '💡 Colonne <code>_location_</code> masquée — contient le chemin R2 de ce fichier.</span>',
-        unsafe_allow_html=True,
-    )
+    st.markdown('<span style="font-size:.7rem;color:#55556a;">💡 Colonne <code>_location_</code> masquée (chemin R2).</span>',unsafe_allow_html=True)
 
-    edited = st.data_editor(
+    # ── Éditeur ───────────────────────────────────────────────────────────────
+    visible_df=df[vis].copy()
+
+    # Clé stable = ne change pas entre reruns sauf si on ouvre une autre table
+    editor_key=f"de_{fid}"
+
+    edited=st.data_editor(
         visible_df,
         use_container_width=True,
-        num_rows="dynamic",
-        key=f"de_{file_id}",
-        column_config={c: st.column_config.TextColumn(c, width="medium") for c in visible_cols},
+        num_rows="fixed",        # ← FIXED : on gère les lignes via resize
+        key=editor_key,
+        column_config={c: st.column_config.TextColumn(c,width="medium") for c in vis},
         hide_index=False,
     )
 
-    # Détection de changements
-    if not edited.equals(visible_df):
-        _tbl_push_undo()
-        loc = st.session_state.table_df["_location_"].copy()
-        st.session_state.table_df = edited.copy()
-        diff = len(edited) - len(loc)
-        if diff > 0:
-            loc = pd.concat([loc, pd.Series([""] * diff)], ignore_index=True)
-        elif diff < 0:
-            loc = loc.iloc[:len(edited)].reset_index(drop=True)
-        st.session_state.table_df.insert(0, "_location_", loc.values)
-        st.session_state.redo_stack = []
-        ds.save_table(file_id, st.session_state.table_df)
+    # CORRECTIF EFFACEMENT : comparaison par hash, pas equals()
+    edited_hash=_df_hash(edited)
+    if edited_hash != st.session_state.table_hash:
+        _tpush_undo()
+        loc=st.session_state.table_df["_location_"].copy()
+        new_df=edited.copy()
+        new_df.insert(0,"_location_",loc.values[:len(edited)])
+        st.session_state.table_df=new_df
+        st.session_state.table_hash=edited_hash
+        st.session_state.redo_stack=[]
+        if st.session_state.tbl_autosave:
+            ds.save_table(fid,new_df)
 
-    nrows, ncols = visible_df.shape
+    nr,nc=visible_df.shape
     st.markdown(
-        f'<div style="font-size:0.7rem;color:#55556a;margin-top:6px;">'
-        f'📐 {nrows} lignes × {ncols} colonnes &nbsp;|&nbsp; '
-        f'☁️ tables/{file_id}.parquet</div>',
-        unsafe_allow_html=True,
-    )
+        f'<div style="font-size:.7rem;color:#55556a;margin-top:5px;">'
+        f'📐 {nr} lignes × {nc} colonnes &nbsp;|&nbsp; ☁️ tables/{fid}.parquet'
+        f'{"&nbsp;|&nbsp;🔄 Autosave ON" if st.session_state.tbl_autosave else "&nbsp;|&nbsp;⏸ Autosave OFF"}'
+        f'</div>', unsafe_allow_html=True)
 
 
-def _tbl_push_undo():
+def _df_hash(df: pd.DataFrame) -> str:
+    """Hash rapide d'un DataFrame pour détecter les changements sans equals()."""
+    try: return hashlib.md5(pd.util.hash_pandas_object(df,index=True).values.tobytes()).hexdigest()
+    except: return str(df.shape)
+
+def _tpush_undo():
     st.session_state.undo_stack.append(st.session_state.table_df.copy(deep=True))
-    if len(st.session_state.undo_stack) > 50:
-        st.session_state.undo_stack.pop(0)
+    if len(st.session_state.undo_stack)>50: st.session_state.undo_stack.pop(0)
 
-
-def _tbl_undo(ds: DataStore, file_id: str):
-    if not st.session_state.undo_stack:
-        return
+def _tundo(ds,fid):
+    if not st.session_state.undo_stack: return
     st.session_state.redo_stack.append(st.session_state.table_df.copy(deep=True))
-    st.session_state.table_df = st.session_state.undo_stack.pop()
-    ds.save_table(file_id, st.session_state.table_df)
+    st.session_state.table_df=st.session_state.undo_stack.pop()
+    st.session_state.table_hash=_df_hash(st.session_state.table_df)
+    ds.save_table(fid,st.session_state.table_df)
 
-
-def _tbl_redo(ds: DataStore, file_id: str):
-    if not st.session_state.redo_stack:
-        return
+def _tredo(ds,fid):
+    if not st.session_state.redo_stack: return
     st.session_state.undo_stack.append(st.session_state.table_df.copy(deep=True))
-    st.session_state.table_df = st.session_state.redo_stack.pop()
-    ds.save_table(file_id, st.session_state.table_df)
+    st.session_state.table_df=st.session_state.redo_stack.pop()
+    st.session_state.table_hash=_df_hash(st.session_state.table_df)
+    ds.save_table(fid,st.session_state.table_df)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 9 — VUE MAP BRAINSTORMING (canvas HTML5)
+#  §10 — VUE MAP BRAINSTORMING
+#  Nouveautés : undo/redo JS, sélection auto en mode création,
+#  colonne "writable", zone d'écriture adaptée, min-size contrôlée,
+#  frappe clavier directe sur objet sélectionné, autosave toggle.
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _build_canvas_html(objects_json: str, file_id: str) -> str:
-    return f"""<!DOCTYPE html>
-<html>
-<head><meta charset="UTF-8">
+def _build_canvas_html(objs_json: str, fid: str) -> str:
+    return f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
 <style>
-  *{{box-sizing:border-box;margin:0;padding:0;}}
-  body{{background:#16161d;font-family:'JetBrains Mono',monospace;color:#e8e8f0;user-select:none;overflow:hidden;}}
-  #tb{{display:flex;align-items:center;gap:5px;padding:7px 12px;background:#1c1c26;border-bottom:1px solid #2a2a3a;flex-wrap:wrap;}}
-  .tb{{padding:5px 11px;border-radius:5px;border:1px solid #2a2a3a;background:#22222e;color:#8888aa;font-size:.74rem;cursor:pointer;font-family:inherit;transition:all .15s;white-space:nowrap;}}
-  .tb:hover{{border-color:#6c63ff;color:#8b85ff;background:rgba(108,99,255,.1);}}
-  .tb.on{{border-color:rgba(108,99,255,.7);background:rgba(108,99,255,.2);color:#8b85ff;}}
-  .sep{{width:1px;height:20px;background:#2a2a3a;margin:0 2px;flex-shrink:0;}}
-  #zd{{font-size:.7rem;color:#55556a;min-width:42px;text-align:center;}}
-  #hint{{font-size:.68rem;color:#55556a;margin-left:4px;flex:1;}}
-  #st{{font-size:.68rem;color:#4ade80;}}
-  #cw{{position:relative;overflow:hidden;width:100%;height:calc(100vh - 50px);
-       background:#0f0f13;background-image:radial-gradient(circle,#1e1e28 1px,transparent 1px);background-size:28px 28px;}}
-  #cv{{display:block;}}
-  #te{{position:absolute;display:none;border:2px solid #6c63ff;background:rgba(22,22,32,.97);
-       color:#e8e8f0;font-family:'JetBrains Mono',monospace;font-size:13px;resize:none;
-       outline:none;padding:7px;border-radius:4px;overflow:hidden;text-align:center;line-height:1.4;}}
-  #ah{{position:absolute;top:7px;right:12px;font-size:.7rem;color:#8b85ff;
-       background:rgba(108,99,255,.15);padding:3px 9px;border-radius:4px;display:none;pointer-events:none;}}
-</style></head>
-<body>
+*{{box-sizing:border-box;margin:0;padding:0;}}
+body{{background:#16161d;font-family:'JetBrains Mono',monospace;color:#e8e8f0;user-select:none;overflow:hidden;}}
+#tb{{display:flex;align-items:center;gap:5px;padding:7px 12px;background:#1c1c26;border-bottom:1px solid #2a2a3a;flex-wrap:wrap;}}
+.tb{{padding:5px 11px;border-radius:5px;border:1px solid #2a2a3a;background:#22222e;color:#8888aa;font-size:.74rem;cursor:pointer;font-family:inherit;transition:all .15s;white-space:nowrap;}}
+.tb:hover{{border-color:#6c63ff;color:#8b85ff;background:rgba(108,99,255,.1);}}
+.tb.on{{border-color:rgba(108,99,255,.7);background:rgba(108,99,255,.2);color:#8b85ff;}}
+.sep{{width:1px;height:20px;background:#2a2a3a;margin:0 2px;flex-shrink:0;}}
+#zd{{font-size:.7rem;color:#55556a;min-width:42px;text-align:center;}}
+#hint{{font-size:.68rem;color:#55556a;margin-left:4px;flex:1;}}
+#st{{font-size:.68rem;color:#4ade80;}}
+#cw{{position:relative;overflow:hidden;width:100%;height:calc(100vh - 52px);
+     background:#0f0f13;background-image:radial-gradient(circle,#1e1e28 1px,transparent 1px);background-size:28px 28px;}}
+#cv{{display:block;}}
+#te{{position:absolute;display:none;border:2px solid #6c63ff;background:rgba(22,22,32,.97);
+     color:#e8e8f0;font-family:'JetBrains Mono',monospace;font-size:13px;resize:none;
+     outline:none;padding:7px;border-radius:4px;overflow:hidden;text-align:center;line-height:1.4;}}
+#ah{{position:absolute;top:7px;right:12px;font-size:.7rem;color:#8b85ff;
+     background:rgba(108,99,255,.15);padding:3px 9px;border-radius:4px;display:none;pointer-events:none;}}
+</style></head><body>
 <div id="tb">
-  <button class="tb on" id="bs" onclick="setTool('select')">&#128432; Selection</button>
+  <button class="tb on" id="bs" onclick="setTool('select')">&#128432; Sélection</button>
   <button class="tb" id="br" onclick="setTool('rect')">&#9645; Rectangle</button>
-  <button class="tb" id="ba" onclick="setTool('arrow')">&#8594; Fleche</button>
+  <button class="tb" id="ba" onclick="setTool('arrow')">&#8594; Flèche</button>
   <div class="sep"></div>
   <button class="tb" onclick="zoom(.15)">&#128269;+</button>
   <div id="zd">100%</div>
   <button class="tb" onclick="zoom(-.15)">&#128269;-</button>
   <button class="tb" onclick="resetView()">&#8855;</button>
   <div class="sep"></div>
-  <button class="tb" onclick="delSel()">&#128465;</button>
+  <button class="tb" onclick="mapUndo()">&#8617; Annuler</button>
+  <button class="tb" onclick="mapRedo()">&#8618; Rétablir</button>
+  <div class="sep"></div>
+  <button class="tb" onclick="toggleWritable()" id="btn_wr">&#9998; Éditable: OUI</button>
+  <div class="sep"></div>
+  <button class="tb" onclick="delSel()">&#128465; Suppr.</button>
   <div class="sep"></div>
   <button class="tb" onclick="exportJSON()" style="border-color:rgba(108,99,255,.5);color:#8b85ff;">&#128190; Export JSON</button>
   <span id="hint">Alt+drag: panoramique</span>
@@ -1126,26 +829,35 @@ def _build_canvas_html(objects_json: str, file_id: str) -> str:
 </div>
 <div id="cw">
   <canvas id="cv"></canvas>
-  <textarea id="te" maxlength="500"></textarea>
+  <textarea id="te" maxlength="2000"></textarea>
   <div id="ah">Source &#8594; cliquer la cible</div>
 </div>
 <script>
 const cv=document.getElementById('cv'),ctx=cv.getContext('2d'),
       cw=document.getElementById('cw'),te=document.getElementById('te'),
       ah=document.getElementById('ah'),stEl=document.getElementById('st'),
-      hintEl=document.getElementById('hint');
-let objs={objects_json},tool='select',sc=1,ox=50,oy=50;
+      hintEl=document.getElementById('hint'),btnWr=document.getElementById('btn_wr');
+
+// ── State ─────────────────────────────────────────────────────────────────
+let objs={objs_json};
+let tool='select',sc=1,ox=50,oy=50;
 let selId=null,drag=false,dsx=0,dsy=0,dox=0,doy=0;
 let draw=false,ds={{x:0,y:0}},dc={{x:0,y:0}};
 let rsz=false,rh=null,rs=null,pan=false,px=0,py=0,pox=0,poy=0;
 let eid=null,asrc=null,idc=1;
+// Undo/redo maps
+let undoStack=[],redoStack=[];
 objs.forEach(o=>{{const n=parseInt(String(o.id).replace(/[^0-9]/g,''))||0;if(n>=idc)idc=n+1;}});
 
+// ── Canvas resize ─────────────────────────────────────────────────────────
 function resizeCv(){{cv.width=cw.clientWidth;cv.height=cw.clientHeight;render();}}
 window.addEventListener('resize',resizeCv);resizeCv();
 
+// ── Coords ────────────────────────────────────────────────────────────────
 function tw(cx,cy){{return{{x:(cx-ox)/sc,y:(cy-oy)/sc}};}}
 function gp(e){{const r=cv.getBoundingClientRect();return{{x:e.clientX-r.left,y:e.clientY-r.top}};}}
+
+// ── Hit testing ───────────────────────────────────────────────────────────
 function hRect(o,wx,wy){{return o.type==='rectangle'&&wx>=o.x&&wx<=o.x+o.w&&wy>=o.y&&wy<=o.y+o.h;}}
 function hTest(wx,wy){{for(let i=objs.length-1;i>=0;i--){{if(hRect(objs[i],wx,wy))return objs[i];}}return null;}}
 function gHandles(o){{
@@ -1156,6 +868,52 @@ function gHandles(o){{
 }}
 function hHandle(o,wx,wy){{const t=7/sc;for(const h of gHandles(o)){{if(Math.abs(wx-h.x)<t&&Math.abs(wy-h.y)<t)return h.id;}}return null;}}
 
+// ── Min size based on text content ────────────────────────────────────────
+function minSizeForText(o){{
+  if(o.type!=='rectangle'||!o.label)return{{w:60,h:36}};
+  const fs=14; ctx.font=fs+'px JetBrains Mono,monospace';
+  const words=o.label.split(' ');let maxWord=0;
+  words.forEach(w=>{{const m=ctx.measureText(w).width;if(m>maxWord)maxWord=m;}});
+  const minW=Math.max(60,maxWord+28);
+  const linesEst=Math.ceil(o.label.length/Math.max(1,Math.floor(minW/8)));
+  const minH=Math.max(36,linesEst*fs*1.5+20);
+  return{{w:minW,h:minH}};
+}}
+
+// ── Undo/Redo ─────────────────────────────────────────────────────────────
+function pushUndo(){{
+  undoStack.push(JSON.stringify(objs));
+  if(undoStack.length>40)undoStack.shift();
+  redoStack=[];
+}}
+function mapUndo(){{
+  if(!undoStack.length)return;
+  redoStack.push(JSON.stringify(objs));
+  objs=JSON.parse(undoStack.pop());
+  selId=null;render();
+}}
+function mapRedo(){{
+  if(!redoStack.length)return;
+  undoStack.push(JSON.stringify(objs));
+  objs=JSON.parse(redoStack.pop());
+  selId=null;render();
+}}
+
+// ── Writable toggle ───────────────────────────────────────────────────────
+function toggleWritable(){{
+  const o=objs.find(x=>x.id===selId);
+  if(!o||o.type!=='rectangle')return;
+  o.writable=(o.writable!==false)?false:true;
+  btnWr.textContent='✎ Éditable: '+(o.writable!==false?'OUI':'NON');
+  render();
+}}
+function updateWritableBtn(){{
+  const o=objs.find(x=>x.id===selId);
+  if(!o||o.type!=='rectangle'){{btnWr.textContent='✎ Éditable: —';return;}}
+  btnWr.textContent='✎ Éditable: '+(o.writable!==false?'OUI':'NON');
+}}
+
+// ── Render ────────────────────────────────────────────────────────────────
 function render(){{
   ctx.clearRect(0,0,cv.width,cv.height);
   ctx.save();ctx.translate(ox,oy);ctx.scale(sc,sc);
@@ -1176,9 +934,18 @@ function drawRect(o){{
   ctx.save();
   if(sel){{ctx.shadowColor='rgba(108,99,255,.55)';ctx.shadowBlur=12/sc;}}
   ctx.fillStyle=o.fill||'#1c1c36';
-  ctx.strokeStyle=sel?'#6c63ff':'#3a3a5a';ctx.lineWidth=(sel?2:1)/sc;
+  ctx.strokeStyle=sel?'#6c63ff':(o.writable===false?'#4a4a5a':'#3a3a5a');
+  ctx.lineWidth=(sel?2:1)/sc;
+  if(o.writable===false)ctx.setLineDash([4/sc,2/sc]);
   ctx.beginPath();rr(ctx,o.x,o.y,o.w,o.h,8/sc);ctx.fill();ctx.stroke();
+  ctx.setLineDash([]);
   ctx.restore();
+  // Badge non-editable
+  if(o.writable===false){{
+    ctx.save();ctx.fillStyle='rgba(85,85,106,.7)';ctx.font=`${{9/sc}}px JetBrains Mono,monospace`;
+    ctx.textAlign='right';ctx.textBaseline='top';
+    ctx.fillText('🔒',o.x+o.w-4/sc,o.y+4/sc);ctx.restore();
+  }}
   if(o.label&&o.id!==eid){{
     ctx.save();
     const fs=Math.max(9,Math.min(14,o.w/14));
@@ -1220,10 +987,17 @@ function wrapText(ctx,text,maxW){{
   for(const w of words){{const t=line?line+' '+w:w;if(ctx.measureText(t).width>maxW&&line){{lines.push(line);line=w;}}else{{line=t;}}}}
   if(line)lines.push(line);return lines.length?lines:[''];
 }}
+
+// ── Text editor ───────────────────────────────────────────────────────────
 function openEditor(o){{
-  eid=o.id;const cx=o.x*sc+ox,cy=o.y*sc+oy;
-  te.style.cssText='display:block;position:absolute;left:'+cx+'px;top:'+cy+'px;width:'+o.w*sc+'px;height:'+o.h*sc+'px;font-size:'+Math.max(10,Math.min(14,o.w/14))+'px;';
-  te.value=o.label||'';te.focus();render();
+  if(o.writable===false)return;
+  eid=o.id;
+  const cx=o.x*sc+ox,cy=o.y*sc+oy;
+  te.style.cssText=`display:block;position:absolute;left:${{cx}}px;top:${{cy}}px;width:${{o.w*sc}}px;height:${{o.h*sc}}px;font-size:${{Math.max(10,Math.min(14,o.w/14))}}px;`;
+  te.value=o.label||'';te.focus();
+  // Move cursor to end
+  const len=te.value.length;te.setSelectionRange(len,len);
+  render();
 }}
 function closeEditor(){{
   if(eid!==null){{const o=objs.find(x=>x.id===eid);if(o)o.label=te.value;eid=null;te.style.display='none';render();}}
@@ -1232,71 +1006,120 @@ te.addEventListener('input',()=>{{const o=objs.find(x=>x.id===eid);if(o){{o.labe
 te.addEventListener('blur',closeEditor);
 te.addEventListener('keydown',e=>{{if(e.key==='Escape')closeEditor();e.stopPropagation();}});
 
+// ── Tool switching ────────────────────────────────────────────────────────
 function setTool(t){{
   tool=t;asrc=null;ah.style.display='none';
-  document.querySelectorAll('.tb[id^="b"]').forEach(b=>b.classList.remove('on'));
+  ['bs','br','ba'].forEach(id=>document.getElementById(id).classList.remove('on'));
   const btn=document.getElementById('b'+t[0]);if(btn)btn.classList.add('on');
   closeEditor();
   const cursors={{select:'default',rect:'crosshair',arrow:'crosshair'}};
   cv.style.cursor=cursors[t]||'default';
-  const hints={{select:'Clic: sel | Dbl-clic: editer | Drag: deplacer',rect:'Glisser pour creer un rectangle',arrow:'Cliquer source puis cible'}};
+  const hints={{select:'Clic: sél | Dbl-clic ou frappe: éditer | Drag: déplacer',
+                rect:'Glisser pour créer | Clic sur existant: sélectionner',
+                arrow:'Cliquer source puis cible | Clic sur existant: sélectionner'}};
   hintEl.textContent=hints[t]||'';
 }}
 
+// ── Mouse ─────────────────────────────────────────────────────────────────
 cv.addEventListener('mousedown',e=>{{
   e.preventDefault();const cp=gp(e),wp=tw(cp.x,cp.y);
   if(e.button===1||(e.button===0&&e.altKey)){{pan=true;px=cp.x;py=cp.y;pox=ox;poy=oy;cv.style.cursor='grabbing';return;}}
   if(e.button!==0)return;closeEditor();
   if(tool==='select'){{
     const sel=selId?objs.find(o=>o.id===selId):null;
-    if(sel&&sel.type==='rectangle'){{const h=hHandle(sel,wp.x,wp.y);if(h){{rsz=true;rh=h;dsx=wp.x;dsy=wp.y;rs={{x:sel.x,y:sel.y,w:sel.w,h:sel.h}};return;}}}}
+    if(sel&&sel.type==='rectangle'){{
+      const h=hHandle(sel,wp.x,wp.y);
+      if(h){{pushUndo();rsz=true;rh=h;dsx=wp.x;dsy=wp.y;rs={{x:sel.x,y:sel.y,w:sel.w,h:sel.h}};return;}}
+    }}
     const hit=hTest(wp.x,wp.y);
-    if(hit){{selId=hit.id;if(hit.type==='rectangle'){{drag=true;dsx=wp.x;dsy=wp.y;dox=hit.x;doy=hit.y;}}}}
-    else{{selId=null;pan=true;px=cp.x;py=cp.y;pox=ox;poy=oy;cv.style.cursor='grabbing';}}
+    if(hit){{
+      selId=hit.id;updateWritableBtn();
+      if(hit.type==='rectangle'){{pushUndo();drag=true;dsx=wp.x;dsy=wp.y;dox=hit.x;doy=hit.y;}}
+    }}else{{selId=null;updateWritableBtn();pan=true;px=cp.x;py=cp.y;pox=ox;poy=oy;cv.style.cursor='grabbing';}}
     render();
-  }}else if(tool==='rect'){{draw=true;ds={{x:wp.x,y:wp.y}};dc={{x:wp.x,y:wp.y}};
-  }}else if(tool==='arrow'){{
-    const hit=hTest(wp.x,wp.y);if(!hit){{asrc=null;ah.style.display='none';return;}}
-    if(!asrc){{asrc=hit.id;ah.style.display='block';}}
+  }} else if(tool==='rect'){{
+    // Clic sur objet existant → sélectionner
+    const hit=hTest(wp.x,wp.y);
+    if(hit){{selId=hit.id;updateWritableBtn();setTool('select');render();return;}}
+    draw=true;ds={{x:wp.x,y:wp.y}};dc={{x:wp.x,y:wp.y}};
+  }} else if(tool==='arrow'){{
+    // Clic sur objet existant toujours sélectionnable
+    const hit=hTest(wp.x,wp.y);
+    if(!hit){{asrc=null;ah.style.display='none';return;}}
+    if(!asrc){{asrc=hit.id;selId=hit.id;updateWritableBtn();ah.style.display='block';render();}}
     else if(asrc!==hit.id){{
+      pushUndo();
       const src=objs.find(o=>o.id===asrc),dst=hit;
-      objs.push({{id:'a'+(idc++),type:'arrow',x1:src.x+src.w/2,y1:src.y+src.h/2,x2:dst.x+dst.w/2,y2:dst.y+dst.h/2,label:'',srcId:asrc,dstId:hit.id}});
+      objs.push({{id:'a'+(idc++),type:'arrow',x1:src.x+src.w/2,y1:src.y+src.h/2,
+                  x2:dst.x+dst.w/2,y2:dst.y+dst.h/2,label:'',srcId:asrc,dstId:hit.id,writable:true}});
       asrc=null;ah.style.display='none';render();
     }}
   }}
 }});
+
 cv.addEventListener('mousemove',e=>{{
   const cp=gp(e),wp=tw(cp.x,cp.y);
   if(pan){{ox=pox+(cp.x-px);oy=poy+(cp.y-py);render();return;}}
   if(drag&&selId){{const o=objs.find(x=>x.id===selId);if(o&&o.type==='rectangle'){{o.x=dox+(wp.x-dsx);o.y=doy+(wp.y-dsy);syncArrows(o);render();}}}}
   if(rsz&&selId){{
-    const o=objs.find(x=>x.id===selId);if(o){{
+    const o=objs.find(x=>x.id===selId);
+    if(o){{
+      const ms=minSizeForText(o);
       const dx=wp.x-dsx,dy=wp.y-dsy;
-      if(rh.includes('e'))o.w=Math.max(60,rs.w+dx);
-      if(rh.includes('s'))o.h=Math.max(36,rs.h+dy);
-      if(rh.includes('w')){{o.x=rs.x+dx;o.w=Math.max(60,rs.w-dx);}}
-      if(rh.includes('n')){{o.y=rs.y+dy;o.h=Math.max(36,rs.h-dy);}}
+      if(rh.includes('e'))o.w=Math.max(ms.w,rs.w+dx);
+      if(rh.includes('s'))o.h=Math.max(ms.h,rs.h+dy);
+      if(rh.includes('w')){{const nw=Math.max(ms.w,rs.w-dx);o.x=rs.x+(rs.w-nw);o.w=nw;}}
+      if(rh.includes('n')){{const nh=Math.max(ms.h,rs.h-dy);o.y=rs.y+(rs.h-nh);o.h=nh;}}
       syncArrows(o);if(eid===o.id)openEditor(o);render();
     }}
   }}
   if(draw){{dc={{x:wp.x,y:wp.y}};render();}}
 }});
+
 cv.addEventListener('mouseup',e=>{{
-  const curs={{select:'default',rect:'crosshair',arrow:'crosshair'}};cv.style.cursor=curs[tool]||'default';
+  const curs={{select:'default',rect:'crosshair',arrow:'crosshair'}};
+  cv.style.cursor=curs[tool]||'default';
   if(pan){{pan=false;return;}}
   if(draw){{
     draw=false;const w=dc.x-ds.x,h=dc.y-ds.y;
-    if(Math.abs(w)>25&&Math.abs(h)>20){{
-      const o={{id:'r'+(idc++),type:'rectangle',x:w>0?ds.x:ds.x+w,y:h>0?ds.y:ds.y+h,w:Math.abs(w),h:Math.abs(h),label:'',fill:'#1c1c36'}};
-      objs.push(o);selId=o.id;
+    if(Math.abs(w)>20&&Math.abs(h)>16){{
+      pushUndo();
+      const o={{id:'r'+(idc++),type:'rectangle',x:w>0?ds.x:ds.x+w,y:h>0?ds.y:ds.y+h,
+               w:Math.abs(w),h:Math.abs(h),label:'',fill:'#1c1c36',writable:true}};
+      objs.push(o);selId=o.id;updateWritableBtn();
     }}render();
   }}
   if(drag||rsz){{drag=false;rsz=false;}}
 }});
+
 cv.addEventListener('dblclick',e=>{{
   const cp=gp(e),wp=tw(cp.x,cp.y);
-  if(tool==='select'){{const hit=hTest(wp.x,wp.y);if(hit&&hit.type==='rectangle'){{selId=hit.id;openEditor(hit);}}}}
+  const hit=hTest(wp.x,wp.y);
+  if(hit&&hit.type==='rectangle'){{selId=hit.id;updateWritableBtn();openEditor(hit);}}
 }});
+
+// Frappe clavier directe sur l'objet sélectionné
+document.addEventListener('keydown',e=>{{
+  if(e.target!==document.body)return;
+  if(e.key==='Delete'||e.key==='Backspace'){{delSel();return;}}
+  if(e.key==='Escape'){{selId=null;render();return;}}
+  // Si un rectangle est sélectionné et éditable → ouvrir l'éditeur et ajouter le caractère
+  if(selId&&e.key.length===1&&!e.ctrlKey&&!e.metaKey){{
+    const o=objs.find(x=>x.id===selId);
+    if(o&&o.type==='rectangle'&&o.writable!==false){{
+      openEditor(o);
+      // Ajouter le caractère tapé à la suite
+      te.value=(o.label||'')+e.key;
+      o.label=te.value;
+      const len=te.value.length;te.setSelectionRange(len,len);
+      render();
+    }}
+  }}
+  // Ctrl+Z / Ctrl+Y
+  if(e.key==='z'&&e.ctrlKey){{mapUndo();}}
+  if((e.key==='y'&&e.ctrlKey)||(e.key==='Z'&&e.ctrlKey&&e.shiftKey)){{mapRedo();}}
+}});
+
 cv.addEventListener('wheel',e=>{{
   e.preventDefault();const cp=gp(e),d=e.deltaY<0?.12:-.12;
   const ns=Math.max(.08,Math.min(6,sc+d));
@@ -1304,12 +1127,13 @@ cv.addEventListener('wheel',e=>{{
 }},{{passive:false}});
 function zoom(d){{const cx=cv.width/2,cy=cv.height/2;const ns=Math.max(.08,Math.min(6,sc+d));ox=cx-(cx-ox)*(ns/sc);oy=cy-(cy-oy)*(ns/sc);sc=ns;render();}}
 function resetView(){{sc=1;ox=50;oy=50;render();}}
+
 function delSel(){{
-  if(!selId)return;
+  if(!selId)return;pushUndo();
   objs=objs.filter(o=>o.id!==selId&&o.srcId!==selId&&o.dstId!==selId);
-  selId=null;render();
+  selId=null;updateWritableBtn();render();
 }}
-document.addEventListener('keydown',e=>{{if(e.target===document.body&&(e.key==='Delete'||e.key==='Backspace'))delSel();}});
+
 function syncArrows(rect){{
   objs.filter(o=>o.type==='arrow').forEach(a=>{{
     const src=objs.find(x=>x.id===a.srcId),dst=objs.find(x=>x.id===a.dstId);
@@ -1317,153 +1141,110 @@ function syncArrows(rect){{
     if(dst){{a.x2=dst.x+dst.w/2;a.y2=dst.y+dst.h/2;}}
   }});
 }}
+
 function exportJSON(){{
   const data=objs.map(o=>{{
     let c={{}};
     if(o.type==='rectangle')c={{x:o.x,y:o.y,w:o.w,h:o.h}};
     else if(o.type==='arrow')c={{x1:o.x1,y1:o.y1,x2:o.x2,y2:o.y2,srcId:o.srcId,dstId:o.dstId}};
-    return{{id:o.id,type:o.type,label:o.label||'',coords:JSON.stringify(c)}};
+    return{{id:o.id,type:o.type,label:o.label||'',coords:JSON.stringify(c),writable:o.writable!==false}};
   }});
   const j=JSON.stringify(data);
-  if(navigator.clipboard)navigator.clipboard.writeText(j).then(()=>{{stEl.textContent='Copie!';setTimeout(()=>stEl.textContent='',3000);}});
-  try{{window.parent.postMessage({{type:'mapSave',file_id:'{file_id}',data:j}},'*');}}catch(e){{}}
-  stEl.textContent='JSON copie — coller ci-dessous';setTimeout(()=>stEl.textContent='',4000);
+  if(navigator.clipboard)navigator.clipboard.writeText(j).then(()=>{{stEl.textContent='Copié!';setTimeout(()=>stEl.textContent='',3000);}});
+  stEl.textContent='JSON copié — coller dans le champ ci-dessous';setTimeout(()=>stEl.textContent='',4000);
 }}
 render();
 </script></body></html>"""
 
 
 def render_map():
-    ds = get_ds()
-    item = st.session_state.get("current_item")
-    if not item:
-        go_back_to_folder()
-        st.rerun()
-        return
+    ds=get_ds()
+    item=st.session_state.get("current_item")
+    if not item: go_back(); st.rerun(); return
+    fid=item["file_id"]
+    df=ds.load_map(fid)
+    if df is None or df.empty: st.error("Map introuvable."); go_back(); st.rerun(); return
 
-    file_id = item["file_id"]
-    df = ds.load_map(file_id)
-    if df is None or df.empty:
-        st.error("Map introuvable dans R2.")
-        go_back_to_folder()
-        st.rerun()
-        return
-
-    # Construire la liste d'objets JS
-    objects_data: list[dict] = []
-    for _, row in df.iterrows():
-        if str(row.get("type", "")) == "meta":
-            continue
-        coords: dict = {}
-        try:
-            coords = json.loads(str(row.get("coords", "{}")))
-        except Exception:
-            pass
-        obj: dict = {
-            "id": str(row["object_id"]),
-            "type": str(row["type"]),
-            "label": str(row.get("label", "")),
-        }
-        if row["type"] == "rectangle":
-            obj.update({"x": float(coords.get("x", 100)), "y": float(coords.get("y", 100)),
-                         "w": float(coords.get("w", 180)), "h": float(coords.get("h", 100)),
-                         "fill": "#1c1c36"})
-        elif row["type"] == "arrow":
-            obj.update({"x1": float(coords.get("x1", 0)), "y1": float(coords.get("y1", 0)),
-                         "x2": float(coords.get("x2", 100)), "y2": float(coords.get("y2", 100)),
-                         "srcId": coords.get("srcId"), "dstId": coords.get("dstId")})
-        objects_data.append(obj)
-
-    objects_json = json.dumps(objects_data, ensure_ascii=False)
+    # Construire liste objets JS
+    objs=[]
+    for _,row in df.iterrows():
+        if str(row.get("type",""))=="meta": continue
+        coords={}
+        try: coords=json.loads(str(row.get("coords","{}")))
+        except: pass
+        o={"id":str(row["object_id"]),"type":str(row["type"]),
+           "label":str(row.get("label","")),"writable":str(row.get("writable","true")).lower()!="false"}
+        if row["type"]=="rectangle":
+            o.update({"x":float(coords.get("x",100)),"y":float(coords.get("y",100)),
+                      "w":float(coords.get("w",180)),"h":float(coords.get("h",100)),"fill":"#1c1c36"})
+        elif row["type"]=="arrow":
+            o.update({"x1":float(coords.get("x1",0)),"y1":float(coords.get("y1",0)),
+                      "x2":float(coords.get("x2",100)),"y2":float(coords.get("y2",100)),
+                      "srcId":coords.get("srcId"),"dstId":coords.get("dstId")})
+        objs.append(o)
+    objs_json=json.dumps(objs,ensure_ascii=False)
 
     # En-tête
-    cb, ct = st.columns([0.14, 0.86])
+    cb,ct=st.columns([.13,.87])
     with cb:
-        if st.button("← Retour", key="map_back", use_container_width=True):
-            go_back_to_folder()
-            st.rerun()
+        if st.button("← Retour",key="map_back",use_container_width=True):
+            go_back(); st.rerun()
     with ct:
-        st.markdown(f'<div class="page-title">🧠 {item["name"]}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="pt">🧠 {item["name"]}</div>',unsafe_allow_html=True)
 
-    # Panneau de sauvegarde manuelle
+    # Autosave toggle
+    c1,c2=st.columns([.3,.7])
+    with c1:
+        autosave=st.toggle("Sauvegarde auto map",value=st.session_state.map_autosave,key="tgl_as_map")
+        st.session_state.map_autosave=autosave
+
+    # Panneau import/export
     with st.expander("💾 Sauvegarder la map (coller le JSON exporté)"):
-        st.markdown(
-            '<span style="font-size:0.77rem;color:#8888aa;">'
-            "1. Cliquer <b>Export JSON</b> dans le canvas (copie dans le presse-papier)<br>"
-            "2. Coller ici → Sauvegarder dans R2</span>",
-            unsafe_allow_html=True,
-        )
-        raw = st.text_area("JSON", key=f"map_json_{file_id}", height=68,
-                           placeholder='[{"id":"r1","type":"rectangle",...}]',
-                           label_visibility="collapsed")
-        if st.button("💾 Sauvegarder dans R2", key=f"save_map_{file_id}", use_container_width=True):
+        st.markdown('<span style="font-size:.77rem;color:#8888aa;">1. Clic <b>Export JSON</b> dans le canvas<br>2. Coller ici → Sauvegarder</span>',unsafe_allow_html=True)
+        raw=st.text_area("JSON",key=f"mj_{fid}",height=68,
+                          placeholder='[{"id":"r1","type":"rectangle",...}]',
+                          label_visibility="collapsed")
+        if st.button("💾 Sauvegarder dans R2",key=f"smr_{fid}",use_container_width=True):
             if raw and raw.strip():
                 try:
-                    _save_map_objects(ds, file_id, df, json.loads(raw.strip()))
-                    st.success("Map sauvegardée dans R2 !")
-                    st.rerun()
-                except Exception as ex:
-                    st.error(f"JSON invalide : {ex}")
+                    _map_save_objects(ds,fid,df,json.loads(raw.strip()))
+                    st.success("Map sauvegardée !"); st.rerun()
+                except Exception as ex: st.error(f"JSON invalide : {ex}")
 
-    components.html(_build_canvas_html(objects_json, file_id), height=640, scrolling=False)
-
-    st.markdown(
-        '<div style="font-size:0.7rem;color:#55556a;margin-top:5px;">'
-        "💡 <b>Alt+Drag</b> pour panoramique &nbsp;|&nbsp; <b>Molette</b> pour zoomer &nbsp;|&nbsp; "
-        "<b>Dbl-clic</b> pour éditer le texte &nbsp;|&nbsp; <b>Suppr.</b> pour effacer</div>",
-        unsafe_allow_html=True,
-    )
+    components.html(_build_canvas_html(objs_json,fid),height=640,scrolling=False)
+    st.markdown('<div style="font-size:.7rem;color:#55556a;margin-top:5px;">💡 <b>Alt+Drag</b>: pan &nbsp;|&nbsp; <b>Molette</b>: zoom &nbsp;|&nbsp; <b>Dbl-clic</b>: éditer &nbsp;|&nbsp; <b>Frappe</b> sur objet sélectionné: écrire &nbsp;|&nbsp; <b>Ctrl+Z/Y</b>: undo/redo</div>',unsafe_allow_html=True)
 
 
-def _save_map_objects(ds: DataStore, file_id: str, original_df: pd.DataFrame, objects: list):
-    location = ""
-    meta = original_df[original_df["type"] == "meta"]
-    if not meta.empty:
-        location = str(meta.iloc[0].get("_location_", ""))
-
-    rows = [{"_location_": location, "object_id": "_meta_", "type": "meta",
-             "label": "map", "coords": "{}"}]
-    for obj in objects:
-        t = obj.get("type", "")
-        coords: dict = {}
-        if t == "rectangle":
-            coords = {k: obj.get(k, 0) for k in ("x", "y", "w", "h")}
-        elif t == "arrow":
-            coords = {k: obj.get(k) for k in ("x1", "y1", "x2", "y2", "srcId", "dstId")}
-        rows.append({"_location_": "", "object_id": str(obj.get("id", "")),
-                     "type": t, "label": str(obj.get("label", "")),
-                     "coords": json.dumps(coords)})
-    ds.save_map(file_id, pd.DataFrame(rows))
+def _map_save_objects(ds,fid,orig_df,objects):
+    loc=""
+    meta=orig_df[orig_df["type"]=="meta"]
+    if not meta.empty: loc=str(meta.iloc[0].get("_location_",""))
+    rows=[{"_location_":loc,"object_id":"_meta_","type":"meta","label":"map","coords":"{}","writable":"false"}]
+    for o in objects:
+        t=o.get("type",""); coords={}
+        if t=="rectangle": coords={k:o.get(k,0) for k in("x","y","w","h")}
+        elif t=="arrow": coords={k:o.get(k) for k in("x1","y1","x2","y2","srcId","dstId")}
+        rows.append({"_location_":"","object_id":str(o.get("id","")),"type":t,
+                     "label":str(o.get("label","")),"coords":json.dumps(coords),
+                     "writable":str(o.get("writable",True)).lower()})
+    ds.save_map(fid,pd.DataFrame(rows))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 10 — POINT D'ENTRÉE PRINCIPAL
+#  §11 — POINT D'ENTRÉE
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    st.set_page_config(
-        page_title="WorkSpace Manager",
-        layout="wide",
-        initial_sidebar_state="expanded",
-    )
-    st.markdown(f"<style>{CSS}</style>", unsafe_allow_html=True)
+    st.set_page_config(page_title="WorkSpace Manager",layout="wide",initial_sidebar_state="expanded")
+    st.markdown(f"<style>{CSS}</style>",unsafe_allow_html=True)
     init_state()
+    with st.sidebar: render_sidebar()
+    user=st.session_state.get("current_user")
+    view=st.session_state.get("view","folder")
+    if user is None: render_all_sessions()
+    elif view=="table": render_table()
+    elif view=="map": render_map()
+    else: render_folder()
 
-    with st.sidebar:
-        render_sidebar()
-
-    current_user = st.session_state.get("current_user")
-    view = st.session_state.get("view", "folder")
-
-    if current_user is None:
-        render_all_sessions()
-    elif view == "table":
-        render_table()
-    elif view == "map":
-        render_map()
-    else:
-        render_folder()
-
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
