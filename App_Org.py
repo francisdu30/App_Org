@@ -349,9 +349,11 @@ def open_item(it): st.session_state.update(current_item=it,view=it["type"],undo_
 def go_back(): st.session_state.update(current_item=None,view="folder",table_df=None,table_serial=None)
 
 def _ser(df:pd.DataFrame) -> str:
-    """Hash déterministe basé sur CSV (plus stable que JSON/parquet)."""
-    try: return df.fillna("").astype(str).to_csv(index=False)
-    except: return str(time.time())
+    """Hash déterministe: normalise chaque valeur en str stripped, ignore les différences de type NaN."""
+    try:
+        # astype(str) puis strip pour éviter les écarts NaN/"nan"/"" selon Streamlit
+        return df.fillna("").astype(str).apply(lambda col: col.str.strip()).to_csv(index=False)
+    except: return str(id(df))
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  §5 — CSS MATCHA
@@ -481,48 +483,88 @@ def _trunc(s:str,n:int=18) -> str:
 
 
 def _render_sidebar_nodes(ds,user,nodes,depth,parent_is_last_flags,max_depth=2):
-    """Rendu arbre avec branches visuelles ASCII propres, 3 niveaux max."""
+    """
+    Arbre avec branches SVG inline HORS des boutons.
+    Layout par nœud :
+      [branche SVG HTML] | [toggle?] [bouton nom] [⋯]
+    Les branches sont rendues en HTML pur dans une colonne étroite à gauche.
+    """
     cc=st.session_state.get("current_cat_id")
+    n_siblings=len(nodes)
+
     for idx,n in enumerate(nodes):
         nid=n["id"]; name=n["name"]
         kids=n.get("children",[]); collapsed=n.get("collapsed",False)
-        sel=cc==nid; is_last=(idx==len(nodes)-1)
+        sel=cc==nid; is_last=(idx==n_siblings-1)
 
-        # ── Branche ASCII ─────────────────────────────────────────────────────
-        prefix=""
-        for il in parent_is_last_flags:
-            prefix+="   " if il else "│  "
-        prefix+="└─ " if is_last else "├─ "
+        # ── Construire le SVG de branche ─────────────────────────────────────
+        # Chaque niveau parent contribue soit une ligne continue (│) soit vide
+        # On dessine le segment du nœud courant : ├─ ou └─
+        branch_w=14*max(depth,1)  # pixels de largeur
+        svg_parts=[]
+        svg_h=32  # hauteur en px par nœud
 
-        # Couleurs selon profondeur
-        if depth==0: name_style="font-size:.82rem;font-weight:500;color:var(--t1);"
-        elif depth==1: name_style="font-size:.75rem;color:var(--t2);"
-        else: name_style="font-size:.70rem;color:var(--t3);"
+        # Lignes verticales des ancêtres
+        for lvl,is_parent_last in enumerate(parent_is_last_flags):
+            x=7+lvl*14
+            if not is_parent_last:
+                svg_parts.append(f'<line x1="{x}" y1="0" x2="{x}" y2="{svg_h}" stroke="#c8dbc0" stroke-width="1.5"/>')
+
+        # Branche du nœud courant
+        cur_x=7+depth*14
+        if depth>0:
+            # Ligne verticale jusqu'au milieu (└ ou ├)
+            bot=svg_h//2 if is_last else svg_h
+            svg_parts.append(f'<line x1="{cur_x}" y1="0" x2="{cur_x}" y2="{bot}" stroke="#c8dbc0" stroke-width="1.5"/>')
+            # Ligne horizontale
+            svg_parts.append(f'<line x1="{cur_x}" y1="{svg_h//2}" x2="{cur_x+12}" y2="{svg_h//2}" stroke="#c8dbc0" stroke-width="1.5"/>')
+            # Petit point vert
+            svg_parts.append(f'<circle cx="{cur_x+12}" cy="{svg_h//2}" r="3" fill="#4a7c59" opacity="0.7"/>')
+
+        total_w=max(14, cur_x+16) if depth>0 else 4
+        svg_html=f'<svg width="{total_w}" height="{svg_h}" style="flex-shrink:0;display:block;">'+''.join(svg_parts)+'</svg>'
+
+        # ── Rendu du nœud ─────────────────────────────────────────────────────
+        # Profondeur → style nom
+        if depth==0:   fs,fw,fc=".82rem","500","#1e2e22"
+        elif depth==1: fs,fw,fc=".76rem","400","#4a6657"
+        else:          fs,fw,fc=".71rem","400","#7a9e88"
 
         icon="📁" if kids else "📂"
-        display=f"{prefix}{icon} {_trunc(name)}"
+        label=f"{icon} {_trunc(name)}"
 
-        # Layout : toggle | label+popover
-        if kids and depth<max_depth:
-            ca,cb,cc2=st.columns([.1,.75,.15])
-            with ca:
+        # Mise en page : branche | toggle? | nom | ⋯
+        has_toggle=bool(kids and depth<max_depth)
+        # Proportions colonnes : branche_html | toggle | nom | popover
+        if depth==0:
+            col_svg_w=0.02
+        else:
+            col_svg_w=min(0.12, 0.04*depth)
+
+        if has_toggle:
+            c_svg,c_tog,c_nom,c_pop=st.columns([col_svg_w, 0.10, 0.73-col_svg_w, 0.15])
+        else:
+            c_svg,c_nom,c_pop=st.columns([col_svg_w, 0.83-col_svg_w, 0.15])
+
+        with c_svg:
+            st.markdown(svg_html, unsafe_allow_html=True)
+
+        if has_toggle:
+            with c_tog:
                 lbl="▶" if collapsed else "▼"
                 if st.button(lbl,key=f"tgl_{nid}",use_container_width=True):
                     ds.tog_col(user,nid); st.rerun()
-            with cb:
-                if st.button(display,key=f"cat_{nid}",
-                             type="primary" if sel else "secondary",use_container_width=True):
-                    set_cat(nid); st.rerun()
-            with cc2:
-                _cat_popover(ds,user,nid,name,cc)
-        else:
-            ca,cb=st.columns([.85,.15])
-            with ca:
-                if st.button(display,key=f"cat_{nid}",
-                             type="primary" if sel else "secondary",use_container_width=True):
-                    set_cat(nid); st.rerun()
-            with cb:
-                _cat_popover(ds,user,nid,name,cc)
+
+        with c_nom:
+            # Bouton sans cadre visible pour les sous-nœuds
+            btn_label=label
+            if st.button(btn_label,key=f"cat_{nid}",
+                         type="primary" if sel else "secondary",
+                         use_container_width=True):
+                set_cat(nid); st.rerun()
+
+        with c_pop:
+            _cat_popover(ds,user,nid,name,cc)
 
         if kids and not collapsed and depth<max_depth:
             _render_sidebar_nodes(ds,user,kids,depth+1,parent_is_last_flags+[is_last],max_depth)
@@ -660,29 +702,36 @@ def render_folder():
 
     kids=node.get("children",[]); items=node.get("items",[])
 
-    # ── Branches visuelles sous-dossiers ──────────────────────────────────────
+    # ── Sous-dossiers avec branches ─────────────────────────────────────────
     if kids:
-        st.markdown('<div style="font-size:.7rem;color:var(--t3);text-transform:uppercase;letter-spacing:.1em;margin:18px 0 6px;">📁 Sous-dossiers</div>',unsafe_allow_html=True)
+        st.markdown('<div style="font-size:.68rem;color:#7a9e88;text-transform:uppercase;letter-spacing:.1em;margin:18px 0 4px;">📁 Sous-dossiers</div>',unsafe_allow_html=True)
+        n_kids=len(kids)
         for idx,ch in enumerate(kids):
-            is_last=(idx==len(kids)-1)
+            is_last=(idx==n_kids-1)
             ni=len(ch.get("items",[])); nc=len(ch.get("children",[]))
-            col_branch,col_content=st.columns([.05,.95])
-            with col_branch:
-                # SVG branche propre
-                line_h="calc(50%)" if is_last else "100%"
-                st.markdown(f"""<div style="position:relative;width:20px;height:64px;">
-  <div style="position:absolute;left:9px;top:0;width:2px;height:{line_h};background:var(--bd,#c8dbc0);"></div>
-  <div style="position:absolute;left:9px;top:31px;width:11px;height:2px;background:var(--bd,#c8dbc0);"></div>
-  <div style="position:absolute;left:18px;top:27px;width:8px;height:8px;border-radius:50%;background:#4a7c59;box-shadow:0 0 0 2px rgba(74,124,89,.2);"></div>
-</div>""",unsafe_allow_html=True)
-            with col_content:
-                # Sous-dossier : fond transparent, nom compact
-                st.markdown(f"""<div style="padding:6px 10px 6px 6px;border-left:2px solid #dde7d6;margin-left:4px;">
-  <div style="font-size:.82rem;color:#1e2e22;font-weight:500;">📁 {ch['name']}</div>
-  <div style="font-size:.63rem;color:#7a9e88;">{ni} fichiers · {nc} sous-dossiers</div>
-</div>""",unsafe_allow_html=True)
-                if st.button("Ouvrir →",key=f"okid_{ch['id']}"):
+            # SVG branche continue sur toute la hauteur du nœud
+            svg_h=48
+            bot_y=svg_h if not is_last else svg_h//2
+            svg=f'''<svg width="28" height="{svg_h}" style="flex-shrink:0;">
+  <line x1="10" y1="0" x2="10" y2="{bot_y}" stroke="#c8dbc0" stroke-width="2"/>
+  <line x1="10" y1="{svg_h//2}" x2="24" y2="{svg_h//2}" stroke="#c8dbc0" stroke-width="2"/>
+  <circle cx="24" cy="{svg_h//2}" r="3.5" fill="#4a7c59" opacity="0.75"/>
+</svg>'''
+            col_svg,col_info,col_btn=st.columns([0.04,0.72,0.24])
+            with col_svg:
+                st.markdown(svg,unsafe_allow_html=True)
+            with col_info:
+                # Pas de cadre, pas de fond — texte flat
+                st.markdown(
+                    f'''<div style="padding:6px 0 6px 4px;line-height:1.3;">
+  <span style="font-size:.85rem;color:#1e2e22;font-weight:500;">📁 {ch['name']}</span>
+  <span style="font-size:.63rem;color:#7a9e88;margin-left:8px;">{ni} fich. · {nc} ss-doss.</span>
+</div>''',unsafe_allow_html=True)
+            with col_btn:
+                st.markdown("<div style='padding-top:6px;'>",unsafe_allow_html=True)
+                if st.button("Ouvrir →",key=f"okid_{ch['id']}",use_container_width=True):
                     set_cat(ch["id"]); st.rerun()
+                st.markdown("</div>",unsafe_allow_html=True)
         st.markdown("<br>",unsafe_allow_html=True)
 
     # ── Fichiers ──────────────────────────────────────────────────────────────
@@ -802,7 +851,16 @@ def render_table():
     visible_df=df[vis].copy().reset_index(drop=True)
     ekey=f"tbl_{fid}"
 
-    # ── DATA EDITOR — clé stable, num_rows fixed ──────────────────────────────
+    # ── DATA EDITOR ───────────────────────────────────────────────────────────
+    # FIX DEFINITIF : on ne compare PLUS la valeur retournée par data_editor
+    # avec visible_df — cela crée de faux positifs car Streamlit peut retourner
+    # des types légèrement différents (NaN vs "", float vs str) selon le rerun.
+    #
+    # Solution : on lit st.session_state[ekey] qui contient le DIFF structuré
+    # Streamlit {"edited_rows":{row:{col:val},...},"added_rows":[...],"deleted_rows":[...]}.
+    # Si ce diff est non-vide, il y a eu une vraie modification utilisateur.
+    # On applique le diff manuellement sur table_df pour reconstruire le nouveau df.
+
     edited=st.data_editor(
         visible_df,
         use_container_width=True,
@@ -812,16 +870,28 @@ def render_table():
         hide_index=False,
     )
 
-    # ── Comparaison CSV déterministe ──────────────────────────────────────────
-    new_serial=_ser(edited)
-    if new_serial != st.session_state.table_serial:
+    # Lire le diff interne Streamlit
+    widget_state=st.session_state.get(ekey,{})
+    edited_rows=widget_state.get("edited_rows",{}) if isinstance(widget_state,dict) else {}
+    has_real_edit=bool(edited_rows) or bool(widget_state.get("added_rows",[]) if isinstance(widget_state,dict) else [])
+
+    if has_real_edit:
+        # Appliquer le diff sur la copie du df en session_state (source de vérité)
         _tpush_undo()
+        base=st.session_state.table_df[vis].copy().reset_index(drop=True)
+        for row_idx_str,changes in edited_rows.items():
+            row_idx=int(row_idx_str)
+            if row_idx<len(base):
+                for col,val in changes.items():
+                    if col in base.columns:
+                        base.at[row_idx,col]="" if val is None else str(val)
         loc=st.session_state.table_df["_location_"].reset_index(drop=True)
-        new_df=edited.reset_index(drop=True).copy()
-        if len(loc)!=len(new_df):
-            loc=loc.reindex(range(len(new_df))).fillna("")
+        new_df=base.copy()
         new_df.insert(0,"_location_",loc.values)
         _commit_table(ds,fid,new_df)
+        # Clear the diff so next render starts clean
+        if isinstance(st.session_state.get(ekey),dict):
+            st.session_state[ekey]["edited_rows"]={}
 
     nr2,nc2=visible_df.shape
     st.markdown(f'<div style="font-size:.68rem;color:var(--t3);margin-top:5px;">📐 {nr2}×{nc2} &nbsp;|&nbsp; ☁️ tables/{fid}.parquet &nbsp;|&nbsp; 🔄 Autosave actif</div>',unsafe_allow_html=True)
@@ -1152,10 +1222,11 @@ te.addEventListener('input',()=>{{
   const o=objs.find(x=>x.id===eid);
   if(o){{o.label=te.value;render();updateCounter(o);saveNow();}}
 }});
-// FIX: blur does NOT close editor — user must click elsewhere on canvas or press Escape
+// FIX: blur does NOT auto-close the editor at all.
+// Editor only closes via: Escape key, or clicking on canvas outside the rect.
+// This prevents the "disappearing shape" bug caused by blur→saveNow→rerun race.
 te.addEventListener('blur',()=>{{
-  // Re-focus unless we intentionally closed
-  if(eid!==null)setTimeout(()=>{{if(eid!==null&&document.activeElement!==te)closeEditorSave();}},150);
+  // intentionally do nothing
 }});
 te.addEventListener('keydown',e=>{{if(e.key==='Escape'){{closeEditorSave();}}e.stopPropagation();}});
 
@@ -1271,18 +1342,18 @@ cv.addEventListener('mouseup',e=>{{
                w:Math.abs(w),h:Math.abs(h),label:'',fill:'#ffffff',writable:true}};
       objs.push(o);selId=o.id;updateWBtn();
       render();
-      // FIX: save IMMEDIATELY before editor opens to lock the object in
+      // FIX: fully reset draw BEFORE saving/opening editor
+      draw=false;
+      mouseDownOnExisting=false;
       saveNow();
-      // Switch to select mode and open editor
       setTool('select');
       openEditor(o,'');
     }}else{{
-      draw=false;render();
+      draw=false;mouseDownOnExisting=false;render();
     }}
   }}else{{
-    draw=false;
+    draw=false;mouseDownOnExisting=false;
   }}
-  mouseDownOnExisting=false;
   if(drag&&selId){{drag=false;saveNow();}}
   if(rsz){{rsz=false;saveNow();}}
 }});
@@ -1304,9 +1375,12 @@ document.addEventListener('keydown',e=>{{
 }});
 
 cv.addEventListener('wheel',e=>{{
-  e.preventDefault();const cp=gp(e),d=e.deltaY<0?.12:-.12;
+  e.preventDefault();
+  // FIX: wheel NEVER touches draw state — just zoom
+  const cp=gp(e),d=e.deltaY<0?.12:-.12;
   const ns=Math.max(.08,Math.min(6,sc+d));
-  ox=cp.x-(cp.x-ox)*(ns/sc);oy=cp.y-(cp.y-oy)*(ns/sc);sc=ns;render();
+  ox=cp.x-(cp.x-ox)*(ns/sc);oy=cp.y-(cp.y-oy)*(ns/sc);sc=ns;
+  render();  // pure render, no state changes
 }},{{passive:false}});
 function zoom(d){{const cx=cv.width/2,cy=cv.height/2;const ns=Math.max(.08,Math.min(6,sc+d));ox=cx-(cx-ox)*(ns/sc);oy=cy-(cy-oy)*(ns/sc);sc=ns;render();}}
 function resetView(){{sc=1;ox=60;oy=60;render();}}
@@ -1333,10 +1407,16 @@ function serObjs(){{
     return{{id:o.id,type:o.type,label:o.label||'',coords:JSON.stringify(c),writable:o.writable!==false}};
   }});
 }}
+let _saveTimer=null;
 function saveNow(){{
-  const payload=JSON.stringify({{fid:FID,loc:LOC,objs:serObjs(),ts:Date.now()}});
-  try{{window.parent.postMessage({{type:'mapSave',payload}},'*');}}catch(e){{}}
-  stEl.textContent='✓';setTimeout(()=>stEl.textContent='',1500);
+  // FIX: never save while a draw gesture is in progress
+  if(draw)return;
+  clearTimeout(_saveTimer);
+  _saveTimer=setTimeout(()=>{{
+    const payload=JSON.stringify({{fid:FID,loc:LOC,objs:serObjs(),ts:Date.now()}});
+    try{{window.parent.postMessage({{type:'mapSave',payload}},'*');}}catch(e){{}}
+    stEl.textContent='✓';setTimeout(()=>stEl.textContent='',1500);
+  }},300);
 }}
 render();
 </script></body></html>"""
