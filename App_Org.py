@@ -416,6 +416,38 @@ div[data-testid="stHorizontalBlock"]{gap:5px!important;}
 .branch-vline.last{background:linear-gradient(var(--bd) 50%,transparent 50%);}
 .branch-hline{width:18px;height:2px;background:var(--bd);flex-shrink:0;}
 .branch-dot{width:8px;height:8px;border-radius:50%;background:var(--ac);flex-shrink:0;margin-right:8px;box-shadow:0 0 0 2px var(--acd);}
+/* Sidebar tree buttons — no border, no background */
+section[data-testid="stSidebar"] .stButton>button{
+  background:transparent!important;
+  border:none!important;
+  box-shadow:none!important;
+  border-radius:6px!important;
+  text-align:left!important;
+  padding:3px 6px!important;
+  font-size:.80rem!important;
+  color:var(--t2)!important;
+  white-space:nowrap!important;
+  overflow:hidden!important;
+  text-overflow:ellipsis!important;
+}
+section[data-testid="stSidebar"] .stButton>button:hover{
+  background:var(--acd)!important;
+  color:var(--ac)!important;
+  border:none!important;
+  box-shadow:none!important;
+}
+section[data-testid="stSidebar"] .stButton>button[kind="primary"]{
+  background:var(--acd)!important;
+  color:var(--acc)!important;
+  border:none!important;
+  box-shadow:none!important;
+  font-weight:600!important;
+}
+/* Toggle ▶/▼ buttons */
+section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] .stButton>button{
+  padding:2px 4px!important;
+  min-width:0!important;
+}
 /* Scrollbar */
 ::-webkit-scrollbar{width:5px;height:5px;}
 ::-webkit-scrollbar-track{background:var(--bg2);}
@@ -521,8 +553,10 @@ def _render_sidebar_nodes(ds,user,nodes,depth,parent_is_last_flags,max_depth=2):
             # Petit point vert
             svg_parts.append(f'<circle cx="{cur_x+12}" cy="{svg_h//2}" r="3" fill="#4a7c59" opacity="0.7"/>')
 
-        total_w=max(14, cur_x+16) if depth>0 else 4
-        svg_html=f'<svg width="{total_w}" height="{svg_h}" style="flex-shrink:0;display:block;">'+''.join(svg_parts)+'</svg>'
+        total_w=max(20, cur_x+16)
+        # Wrap in a div with left margin proportional to depth for indentation
+        indent_px=depth*14
+        svg_html=f'<div style="margin-left:{indent_px}px;line-height:0;margin-bottom:-2px;"><svg width="{total_w}" height="{svg_h}" style="display:block;">'+''.join(svg_parts)+'</svg></div>'
 
         # ── Rendu du nœud ─────────────────────────────────────────────────────
         # Profondeur → style nom
@@ -541,13 +575,15 @@ def _render_sidebar_nodes(ds,user,nodes,depth,parent_is_last_flags,max_depth=2):
         else:
             col_svg_w=min(0.12, 0.04*depth)
 
-        if has_toggle:
-            c_svg,c_tog,c_nom,c_pop=st.columns([col_svg_w, 0.10, 0.73-col_svg_w, 0.15])
-        else:
-            c_svg,c_nom,c_pop=st.columns([col_svg_w, 0.83-col_svg_w, 0.15])
-
-        with c_svg:
+        # Rendre la branche SVG directement (pas dans une colonne)
+        if depth > 0:
             st.markdown(svg_html, unsafe_allow_html=True)
+
+        # Ensuite les boutons dans leurs colonnes
+        if has_toggle:
+            c_tog,c_nom,c_pop=st.columns([0.11, 0.74, 0.15])
+        else:
+            c_nom,c_pop=st.columns([0.85, 0.15])
 
         if has_toggle:
             with c_tog:
@@ -556,9 +592,7 @@ def _render_sidebar_nodes(ds,user,nodes,depth,parent_is_last_flags,max_depth=2):
                     ds.tog_col(user,nid); st.rerun()
 
         with c_nom:
-            # Bouton sans cadre visible pour les sous-nœuds
-            btn_label=label
-            if st.button(btn_label,key=f"cat_{nid}",
+            if st.button(label,key=f"cat_{nid}",
                          type="primary" if sel else "secondary",
                          use_container_width=True):
                 set_cat(nid); st.rerun()
@@ -851,47 +885,39 @@ def render_table():
     visible_df=df[vis].copy().reset_index(drop=True)
     ekey=f"tbl_{fid}"
 
-    # ── DATA EDITOR ───────────────────────────────────────────────────────────
-    # FIX DEFINITIF : on ne compare PLUS la valeur retournée par data_editor
-    # avec visible_df — cela crée de faux positifs car Streamlit peut retourner
-    # des types légèrement différents (NaN vs "", float vs str) selon le rerun.
-    #
-    # Solution : on lit st.session_state[ekey] qui contient le DIFF structuré
-    # Streamlit {"edited_rows":{row:{col:val},...},"added_rows":[...],"deleted_rows":[...]}.
-    # Si ce diff est non-vide, il y a eu une vraie modification utilisateur.
-    # On applique le diff manuellement sur table_df pour reconstruire le nouveau df.
+    # ── DATA EDITOR — FIX DÉFINITIF ──────────────────────────────────────────
+    # Stratégie : on_change callback + flag "_tbl_changed"
+    # data_editor déclenche on_change UNIQUEMENT quand l'utilisateur modifie
+    # une cellule (pas au rerun, pas au chargement).
+    # Le callback pose un flag. Puis on lit le df retourné SEULEMENT si le flag
+    # est posé. Le flag est effacé après application.
 
-    edited=st.data_editor(
+    def _on_table_change():
+        st.session_state._tbl_changed = True
+
+    if "_tbl_changed" not in st.session_state:
+        st.session_state._tbl_changed = False
+
+    edited = st.data_editor(
         visible_df,
         use_container_width=True,
         num_rows="fixed",
         key=ekey,
-        column_config={c:st.column_config.TextColumn(c,width="medium") for c in vis},
+        column_config={c: st.column_config.TextColumn(c, width="medium") for c in vis},
         hide_index=False,
+        on_change=_on_table_change,
     )
 
-    # Lire le diff interne Streamlit
-    widget_state=st.session_state.get(ekey,{})
-    edited_rows=widget_state.get("edited_rows",{}) if isinstance(widget_state,dict) else {}
-    has_real_edit=bool(edited_rows) or bool(widget_state.get("added_rows",[]) if isinstance(widget_state,dict) else [])
-
-    if has_real_edit:
-        # Appliquer le diff sur la copie du df en session_state (source de vérité)
+    if st.session_state._tbl_changed:
+        st.session_state._tbl_changed = False
         _tpush_undo()
-        base=st.session_state.table_df[vis].copy().reset_index(drop=True)
-        for row_idx_str,changes in edited_rows.items():
-            row_idx=int(row_idx_str)
-            if row_idx<len(base):
-                for col,val in changes.items():
-                    if col in base.columns:
-                        base.at[row_idx,col]="" if val is None else str(val)
-        loc=st.session_state.table_df["_location_"].reset_index(drop=True)
-        new_df=base.copy()
-        new_df.insert(0,"_location_",loc.values)
-        _commit_table(ds,fid,new_df)
-        # Clear the diff so next render starts clean
-        if isinstance(st.session_state.get(ekey),dict):
-            st.session_state[ekey]["edited_rows"]={}
+        loc = st.session_state.table_df["_location_"].reset_index(drop=True)
+        new_df = edited.reset_index(drop=True).copy()
+        # Aligner la colonne _location_ si le nombre de lignes a changé
+        if len(loc) != len(new_df):
+            loc = loc.reindex(range(len(new_df))).fillna("")
+        new_df.insert(0, "_location_", loc.values)
+        _commit_table(ds, fid, new_df)
 
     nr2,nc2=visible_df.shape
     st.markdown(f'<div style="font-size:.68rem;color:var(--t3);margin-top:5px;">📐 {nr2}×{nc2} &nbsp;|&nbsp; ☁️ tables/{fid}.parquet &nbsp;|&nbsp; 🔄 Autosave actif</div>',unsafe_allow_html=True)
@@ -1105,13 +1131,16 @@ function render(){{
 }}
 
 function drawRect(o){{
+  // Si cet objet est en cours d'édition dans le textarea HTML, on le dessine
+  // en mode "fantôme" (contour seulement) pour eviter le doublon visuel
+  const isEditing=(o.id===eid);
   const sel=o.id===selId;
   ctx.save();
-  if(sel){{ctx.shadowColor='rgba(74,124,89,.4)';ctx.shadowBlur=14/sc;}}
-  ctx.fillStyle=o.fill||'#ffffff';
-  ctx.strokeStyle=sel?'#4a7c59':(o.writable===false?'#b0c8b0':'#c8dbc0');
-  ctx.lineWidth=(sel?2.5:1.5)/sc;
-  if(o.writable===false){{ctx.setLineDash([5/sc,2/sc]);ctx.strokeStyle='#a0b8a0';}}
+  if(sel&&!isEditing){{ctx.shadowColor='rgba(74,124,89,.4)';ctx.shadowBlur=14/sc;}}
+  ctx.fillStyle=isEditing?'rgba(248,250,248,0.0)':o.fill||'#ffffff';
+  ctx.strokeStyle=isEditing?'#4a7c59':(sel?'#4a7c59':(o.writable===false?'#b0c8b0':'#c8dbc0'));
+  ctx.lineWidth=(sel||isEditing?2:1.5)/sc;
+  if(o.writable===false&&!isEditing){{ctx.setLineDash([5/sc,2/sc]);ctx.strokeStyle='#a0b8a0';}}
   ctx.beginPath();rr(ctx,o.x,o.y,o.w,o.h,10/sc);ctx.fill();ctx.stroke();
   ctx.setLineDash([]);
   if(o.writable===false){{
@@ -1273,7 +1302,8 @@ cv.addEventListener('mousedown',e=>{{
       }}else{{selId=hit.id;updateWBtn();}}
     }}else{{
       mouseDownOnExisting=false;
-      selId=null;updateWBtn();pan=true;px=cp.x;py=cp.y;pox=ox;poy=oy;cv.style.cursor='grabbing';
+      selId=null;updateWBtn();
+      // Clic zone vide = deselect seulement. Pan = Alt+drag uniquement.
     }}
     render();
   }}else if(tool==='rect'){{
@@ -1321,7 +1351,15 @@ cv.addEventListener('mousemove',e=>{{
       if(rh.includes('s'))o.h=Math.max(ms.h,rs.h+dy);
       if(rh.includes('w')){{const nw=Math.max(ms.w,rs.w-dx);o.x=rs.x+(rs.w-nw);o.w=nw;}}
       if(rh.includes('n')){{const nh=Math.max(ms.h,rs.h-dy);o.y=rs.y+(rs.h-nh);o.h=nh;}}
-      syncArrows(o);render();
+      syncArrows(o);
+      // Update textarea position if currently editing this object
+      if(eid===o.id){{
+        const cx2=o.x*sc+ox,cy2=o.y*sc+oy;
+        te.style.left=cx2+'px';te.style.top=cy2+'px';
+        te.style.width=(o.w*sc)+'px';te.style.height=(o.h*sc)+'px';
+      }}
+      render();
+      // NO saveNow here — save only on mouseup
     }}
   }}
   if(draw&&!mouseDownOnExisting){{drawCr={{x:wp.x,y:wp.y}};render();}}
