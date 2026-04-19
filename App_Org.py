@@ -1036,12 +1036,15 @@ def render_table():
     ekey = f"tbl_{fid}"
 
     def _on_change():
+        # on_change est appelé uniquement lors d'une vraie frappe utilisateur.
+        # On lit le diff depuis session_state[ekey].
+        # IMPORTANT : on ne modifie PAS table_vis_df ici pour ne pas provoquer
+        # de réinitialisation du widget par Streamlit au prochain rerun.
         diff = st.session_state.get(ekey)
         if not isinstance(diff, dict): return
         edited_rows = diff.get("edited_rows", {})
         if not edited_rows: return
         _tpush_undo()
-        # Appliquer le diff sur table_df
         base = st.session_state.table_df[vis].copy().reset_index(drop=True)
         for row_str, changes in edited_rows.items():
             try: row_idx = int(row_str)
@@ -1057,12 +1060,14 @@ def render_table():
         new_df.insert(0, "_location_", loc.values)
         st.session_state.table_df = new_df
         st.session_state.redo_stack = []
-        # Mettre à jour vis_df pour que le prochain render montre le bon état
-        st.session_state.table_vis_df = base.reset_index(drop=True)
+        # NE PAS modifier table_vis_df ici — le widget gère ses propres deltas
         ds.sv_table(fid, new_df)
 
+    # Passer une COPIE fraîche à chaque render pour que Streamlit ne détecte
+    # pas de changement d'identité d'objet (évite la réinitialisation du widget).
+    # La copie est identique entre les reruns normaux car table_vis_df ne change pas.
     st.data_editor(
-        st.session_state.table_vis_df,
+        st.session_state.table_vis_df.copy(),
         use_container_width=True,
         num_rows="fixed",
         key=ekey,
@@ -1299,22 +1304,28 @@ function hitHandle(o,wx,wy){{
     if(Math.abs(wx-h.x)<t&&Math.abs(wy-h.y)<t)return h.id;
   return null;
 }}
+// Taille minimale ABSOLUE d'un rectangle (pixels monde).
+// minW = largeur du mot le plus long + marges (ne peut pas aller en dessous).
+// minH = calculée selon la largeur COURANTE du rectangle (pas la minW),
+//        car si on rétrécit en largeur, le texte se wrap et prend plus de hauteur.
+function minW_forLabel(label){{
+  if(!label||!label.length)return 80;
+  let mw=0;
+  label.split(' ').forEach(w=>{{const m=measureW(w);if(m>mw)mw=m;}});
+  return Math.max(80,mw+PAD*2);
+}}
+function minH_forWidth(label,currentW){{
+  if(!label||!label.length)return 44;
+  const textW=Math.max(1,currentW-PAD*2);
+  const lines=wrapText(label,textW);
+  return Math.max(44,lines.length*LINE_H+PAD*2);
+}}
 function minSize(o){{
-  // Taille minimale en pixels MONDE pour contenir le texte.
-  // measureW() retourne des pixels CSS à sc=1 (canvas hors-écran).
-  // Puisque le canvas de mesure est à sc=1, mwCSS === pixels monde.
-  if(!o.label||!o.label.length)return{{w:80,h:44}};
-  // Largeur du mot le plus long (pixels monde, sc indépendant)
-  let mwMonde=0;
-  o.label.split(' ').forEach(w=>{{
-    const m=measureW(w); // pixels CSS = pixels monde à sc=1
-    if(m>mwMonde)mwMonde=m;
-  }});
-  const minW=Math.max(80,mwMonde+PAD*2);
-  // Lignes nécessaires à cette largeur
-  const lines=wrapText(o.label,minW-PAD*2);
-  const minH=Math.max(44,lines.length*LINE_H+PAD*2);
-  return{{w:minW,h:minH}};
+  // minW absolu (basé sur le mot le plus long)
+  // minH calculé sur la largeur ACTUELLE de o (pas la minW)
+  const mw=minW_forLabel(o.label||'');
+  const mh=minH_forWidth(o.label||'',o.w);
+  return{{w:mw,h:mh}};
 }}
 
 // ── Undo/Redo ──────────────────────────────────────────────────────────────
@@ -1682,11 +1693,31 @@ cv.addEventListener('mousemove',e=>{{
   if(rsz&&selId){{
     const o=objs.find(x=>x.id===selId);
     if(o){{
-      const ms=minSize(o),dx=wp.x-dsx,dy=wp.y-dsy;
-      if(rh.includes('e'))o.w=Math.max(ms.w,rs.w+dx);
-      if(rh.includes('s'))o.h=Math.max(ms.h,rs.h+dy);
-      if(rh.includes('w')){{const nw=Math.max(ms.w,rs.w-dx);o.x=rs.x+(rs.w-nw);o.w=nw;}}
-      if(rh.includes('n')){{const nh=Math.max(ms.h,rs.h-dy);o.y=rs.y+(rs.h-nh);o.h=nh;}}
+      const dx=wp.x-dsx,dy=wp.y-dsy;
+      const absMinW=minW_forLabel(o.label||'');
+
+      if(rh.includes('e')){{
+        // Rétrécissement en largeur : autorisé jusqu'au mot le plus long
+        o.w=Math.max(absMinW,rs.w+dx);
+        // Ajuster la hauteur minimale selon la nouvelle largeur
+        const newMinH=minH_forWidth(o.label||'',o.w);
+        if(o.h<newMinH)o.h=newMinH;
+      }}
+      if(rh.includes('w')){{
+        const nw=Math.max(absMinW,rs.w-dx);
+        o.x=rs.x+(rs.w-nw);o.w=nw;
+        const newMinH=minH_forWidth(o.label||'',o.w);
+        if(o.h<newMinH)o.h=newMinH;
+      }}
+      if(rh.includes('s')){{
+        const minH=minH_forWidth(o.label||'',o.w);
+        o.h=Math.max(minH,rs.h+dy);
+      }}
+      if(rh.includes('n')){{
+        const minH=minH_forWidth(o.label||'',o.w);
+        const nh=Math.max(minH,rs.h-dy);
+        o.y=rs.y+(rs.h-nh);o.h=nh;
+      }}
       syncArrows(o);
       if(eid===o.id)repositionTE(o);
       render();
