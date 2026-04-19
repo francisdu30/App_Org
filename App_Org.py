@@ -386,6 +386,7 @@ def init_state():
         "table_df": None,          # source de vérité complète (avec _location_)
         "table_vis_df": None,      # df visible stable passé à data_editor
         "table_fid": None,         # fid de la table courante
+        "_tbl_sig": b"",           # hash du dernier df vu
         "undo_stack": [], "redo_stack": [],
         "map_pending_save": None,
     }
@@ -403,11 +404,13 @@ def set_cat(c):
 def open_item(it):
     st.session_state.update(current_item=it, view=it["type"],
                             undo_stack=[], redo_stack=[],
-                            table_df=None, table_vis_df=None, table_fid=None)
+                            table_df=None, table_vis_df=None,
+                            table_fid=None, _tbl_sig=b"")
 
 def go_back():
     st.session_state.update(current_item=None, view="folder",
-                            table_df=None, table_vis_df=None, table_fid=None)
+                            table_df=None, table_vis_df=None,
+                            table_fid=None, _tbl_sig=b"")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  §5 — CSS
@@ -1026,56 +1029,46 @@ def render_table():
 
     st.markdown("---")
 
-    # ── Data editor avec df stable ────────────────────────────────────────────
-    # On passe TOUJOURS table_vis_df à data_editor (jamais recalculé depuis
-    # table_df lors d'un rerun). Cela empêche Streamlit de réinitialiser
-    # l'état interne du widget et d'effacer les éditions en cours.
-    #
-    # on_change applique le diff (edited_rows) sur table_df (source de vérité)
-    # ET met à jour table_vis_df pour refléter l'état réel.
+    # ── Data editor sans on_change (évite le rerun/flou) ───────────────────────
+    # Architecture :
+    # 1. data_editor reçoit table_vis_df (stable, ne change pas entre reruns).
+    # 2. Il retourne edited (le df avec les modifications de l'utilisateur).
+    # 3. On compare edited et table_vis_df via hash numpy (déterministe).
+    #    Si différent → vraie modification → on sauvegarde sans rerun.
+    # 4. Pas de on_change = pas de rerun supplémentaire = pas de flou.
     ekey = f"tbl_{fid}"
 
-    def _on_change():
-        # on_change est appelé uniquement lors d'une vraie frappe utilisateur.
-        # On lit le diff depuis session_state[ekey].
-        # IMPORTANT : on ne modifie PAS table_vis_df ici pour ne pas provoquer
-        # de réinitialisation du widget par Streamlit au prochain rerun.
-        diff = st.session_state.get(ekey)
-        if not isinstance(diff, dict): return
-        edited_rows = diff.get("edited_rows", {})
-        if not edited_rows: return
-        _tpush_undo()
-        base = st.session_state.table_df[vis].copy().reset_index(drop=True)
-        for row_str, changes in edited_rows.items():
-            try: row_idx = int(row_str)
-            except: continue
-            if row_idx >= len(base): continue
-            for col, val in changes.items():
-                if col in base.columns:
-                    base.at[row_idx, col] = "" if val is None else str(val)
-        loc = st.session_state.table_df["_location_"].reset_index(drop=True)
-        new_df = base.copy()
-        if len(loc) != len(new_df):
-            loc = loc.reindex(range(len(new_df))).fillna("")
-        new_df.insert(0, "_location_", loc.values)
-        st.session_state.table_df = new_df
-        st.session_state.redo_stack = []
-        # NE PAS modifier table_vis_df ici — le widget gère ses propres deltas
-        ds.sv_table(fid, new_df)
-
-    # Passer une COPIE fraîche à chaque render pour que Streamlit ne détecte
-    # pas de changement d'identité d'objet (évite la réinitialisation du widget).
-    # La copie est identique entre les reruns normaux car table_vis_df ne change pas.
-    st.data_editor(
-        st.session_state.table_vis_df.copy(),
+    edited = st.data_editor(
+        st.session_state.table_vis_df,
         use_container_width=True,
         num_rows="fixed",
         key=ekey,
         column_config={c: st.column_config.TextColumn(c, width="medium")
                        for c in vis},
         hide_index=False,
-        on_change=_on_change,
     )
+
+    # Détecter les modifications via hash numpy (fiable, déterministe)
+    def _df_sig(df):
+        return df.fillna("").astype(str).to_numpy().tobytes()
+
+    cur_sig = _df_sig(edited)
+    prev_sig = st.session_state.get("_tbl_sig", b"")
+
+    if cur_sig != prev_sig and prev_sig != b"":
+        # Vraie modification utilisateur
+        _tpush_undo()
+        loc = st.session_state.table_df["_location_"].reset_index(drop=True)
+        new_df = edited.reset_index(drop=True).copy()
+        if len(loc) != len(new_df):
+            loc = loc.reindex(range(len(new_df))).fillna("")
+        new_df.insert(0, "_location_", loc.values)
+        st.session_state.table_df = new_df
+        st.session_state.redo_stack = []
+        ds.sv_table(fid, new_df)
+
+    # Mettre à jour la signature pour le prochain render
+    st.session_state["_tbl_sig"] = cur_sig
 
     nr2, nc2 = st.session_state.table_vis_df.shape
     st.markdown(
@@ -1398,7 +1391,8 @@ function drawRect(o){{
   // Text (only when not in textarea editor)
   if(o.label&&!editing){{
     ctx.save();
-    ctx.font='13px DM Mono,monospace';
+    // Police en pixels monde : 13/sc car ctx est dans un scale(sc,sc)
+    ctx.font=(13/sc)+'px DM Mono,monospace';
     ctx.fillStyle='#1e2e22';ctx.textAlign='center';ctx.textBaseline='middle';
     // Zone de texte : PAD de chaque côté (pixels monde)
     const textW=o.w-PAD*2;
