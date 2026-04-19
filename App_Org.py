@@ -1284,20 +1284,18 @@ function hitHandle(o,wx,wy){{
   return null;
 }}
 function minSize(o){{
-  // Taille minimale pour contenir le texte actuel sans le couper.
-  // Police fixe 13px DM Mono ≈ 7.8px/char, lh=19.5px, padding=16px
+  // Taille minimale pour contenir le texte sans le couper.
+  // Utilise les mêmes constantes que wrapText/maxCharsForRect.
   if(!o.label||!o.label.length)return{{w:80,h:44}};
-  ctx.save();ctx.font='13px DM Mono,monospace';
-  // Largeur du mot le plus long
-  let mw=0;
-  o.label.split(' ').forEach(w=>{{const m=ctx.measureText(w).width;if(m>mw)mw=m;}});
-  ctx.restore();
-  const PAD=16;
-  const minW=Math.max(80,mw+PAD);
-  // Nombre de lignes si on wrap à minW
-  const charsPerLine=Math.max(1,Math.floor((minW-PAD)/7.8));
-  const nLines=Math.max(1,Math.ceil(o.label.length/charsPerLine));
-  const minH=Math.max(44,nLines*19.5+PAD);
+  // Largeur du mot le plus long en pixels CSS réels
+  let mwCSS=0;
+  o.label.split(' ').forEach(w=>{{const m=measureW(w);if(m>mwCSS)mwCSS=m;}});
+  // On veut que la largeur monde satisfasse: (minW - PAD) * sc >= mwCSS
+  // → minW = mwCSS/sc + PAD (pixels monde)
+  const minW=Math.max(80,mwCSS/sc+PAD);
+  // Nombre de lignes nécessaires à cette largeur minimale
+  const lines=wrapText(o.label,minW-PAD);
+  const minH=Math.max(44,lines.length*LINE_H+PAD);
   return{{w:minW,h:minH}};
 }}
 
@@ -1375,13 +1373,13 @@ function drawRect(o){{
     const FS=13;
     ctx.font=FS+'px DM Mono,monospace';
     ctx.fillStyle='#1e2e22';ctx.textAlign='center';ctx.textBaseline='middle';
-    const PAD=16;  // padding horizontal intérieur (pixels monde)
+    // PAD et wrapText sont des globaux cohérents avec maxCharsForRect
     const maxW=o.w-PAD;
-    const lines=wrapText(ctx,o.label,maxW);
+    const lines=wrapText(o.label,maxW);
     const lh=FS*1.5,th=lines.length*lh;
     const sy=o.y+o.h/2-th/2+lh/2;
     ctx.save();
-    // Clip strict à l'intérieur de la forme (avec padding)
+    // Clip strict à l'intérieur de la forme
     ctx.beginPath();
     ctx.rect(o.x+PAD/2,o.y+PAD/2,o.w-PAD,o.h-PAD);
     ctx.clip();
@@ -1443,39 +1441,73 @@ function rrPath(x,y,w,h,r){{
   ctx.lineTo(x+r,y+h);ctx.quadraticCurveTo(x,y+h,x,y+h-r);
   ctx.lineTo(x,y+r);ctx.quadraticCurveTo(x,y,x+r,y);ctx.closePath();
 }}
-function wrapText(ctx,text,maxW){{
+// Canvas de mesure hors-écran : jamais transformé, toujours à sc=1
+const _mCtx=(()=>{{const c=document.createElement('canvas');c.width=1;c.height=1;
+  const x=c.getContext('2d');x.font='13px DM Mono,monospace';return x;}})();
+
+// Mesure un texte en pixels CSS réels (indépendant du zoom canvas)
+function measureW(text){{
+  _mCtx.font='13px DM Mono,monospace';
+  return _mCtx.measureText(text).width;
+}}
+
+// Wrap texte : maxW en pixels monde (coordonnées canvas).
+// On convertit en pixels CSS via sc pour la mesure.
+function wrapText(text,maxWworld){{
   if(!text)return[''];
-  // Forcer une police cohérente avant de mesurer
-  ctx.font='13px DM Mono,monospace';
+  // maxWworld est en pixels monde → en pixels CSS = maxWworld (indépendant du scale
+  // car measureText retourne en CSS et le canvas world est en CSS à scale=1)
+  // MAIS ctx est transformé par scale(sc,sc), donc 1 pixel monde = sc pixels CSS.
+  // ctx.measureText() ne tient PAS compte du transform → toujours CSS.
+  // Donc pour wrap en pixels monde : maxW_CSS = maxWworld * sc
+  const maxW=maxWworld*sc;
   const words=text.split(' ');const lines=[];let line='';
   for(const w of words){{
     const t=line?line+' '+w:w;
-    if(ctx.measureText(t).width>maxW&&line){{lines.push(line);line=w;}}
+    if(measureW(t)>maxW&&line){{lines.push(line);line=w;}}
     else{{line=t;}}
   }}
-  if(line)lines.push(line);return lines.length?lines:[''];
+  // Forcer le wrap des mots très longs (sans espace)
+  const result=[];
+  for(const ln of (line?[...lines,line]:lines)){{
+    if(measureW(ln)>maxW){{
+      let cur='';
+      for(const ch of ln){{
+        if(measureW(cur+ch)>maxW&&cur){{result.push(cur);cur=ch;}}
+        else cur+=ch;
+      }}
+      if(cur)result.push(cur);
+    }}else{{
+      result.push(ln);
+    }}
+  }}
+  return result.length?result:[''];
 }}
 
-// Calcule la limite de caractères pour un rectangle de taille donnée.
-// Police fixe DM Mono 13px : ~7.8px/char, line-height 19.5px, padding 16px H et V.
+// Padding intérieur fixe (pixels monde)
+const PAD=24;
+const CHAR_W_PX=6.2; // Largeur réelle DM Mono 13px (mesurée empiriquement) × 0.8 sécurité
+const LINE_H=19.5;   // 13px × 1.5
+
+// Calcule la limite de caractères pour un rectangle en pixels monde.
 function maxCharsForRect(w,h){{
-  const PAD=16;
-  const CHAR_W=7.8;   // largeur approx d'un caractère en pixels monde
-  const LINE_H=19.5;  // 13px * 1.5
-  const cols=Math.max(1,Math.floor((w-PAD)/CHAR_W));
+  const cols=Math.max(1,Math.floor((w-PAD)/CHAR_W_PX));
   const rows=Math.max(1,Math.floor((h-PAD)/LINE_H));
-  // Marge de sécurité 80% pour ne pas coller aux bords
-  return Math.max(10,Math.floor(cols*rows*0.80));
+  return Math.max(4,Math.floor(cols*rows));
 }}
 
 // ── Textarea editor ────────────────────────────────────────────────────────
 function repositionTE(o){{
   const cx=o.x*sc+ox,cy=o.y*sc+oy;
+  const padPx=Math.round(PAD/2*sc);  // padding en pixels CSS (scalé)
   te.style.left=cx+'px';te.style.top=cy+'px';
   te.style.width=(o.w*sc)+'px';te.style.height=(o.h*sc)+'px';
-  te.style.fontSize='13px';  // Police FIXE — cohérente avec le rendu canvas
+  te.style.fontSize=(13*sc)+'px';  // Police scalée pour correspondre au canvas
   te.style.lineHeight='1.5';
-  te.style.padding='8px';
+  te.style.padding=padPx+'px';
+  te.style.wordBreak='break-word';
+  te.style.whiteSpace='pre-wrap';
+  te.style.overflowWrap='break-word';
   // Limite dynamique
   const cap=maxCharsForRect(o.w,o.h);
   te.maxLength=cap;
