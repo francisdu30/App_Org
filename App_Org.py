@@ -383,8 +383,11 @@ def init_state():
     defs = {
         "current_user": None, "current_cat_id": None,
         "current_item": None, "view": "folder",
-        "table_df": None, "undo_stack": [], "redo_stack": [],
-        "map_pending_save": None,  # JSON string to save to R2
+        "table_df": None,          # source de vérité complète (avec _location_)
+        "table_vis_df": None,      # df visible stable passé à data_editor
+        "table_fid": None,         # fid de la table courante
+        "undo_stack": [], "redo_stack": [],
+        "map_pending_save": None,
     }
     for k, v in defs.items():
         if k not in st.session_state: st.session_state[k] = v
@@ -399,10 +402,12 @@ def set_cat(c):
 
 def open_item(it):
     st.session_state.update(current_item=it, view=it["type"],
-                            undo_stack=[], redo_stack=[], table_df=None)
+                            undo_stack=[], redo_stack=[],
+                            table_df=None, table_vis_df=None, table_fid=None)
 
 def go_back():
-    st.session_state.update(current_item=None, view="folder", table_df=None)
+    st.session_state.update(current_item=None, view="folder",
+                            table_df=None, table_vis_df=None, table_fid=None)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  §5 — CSS
@@ -953,11 +958,17 @@ def render_table():
     fid = item["file_id"]
 
     # ── Chargement initial ────────────────────────────────────────────────────
-    if st.session_state.table_df is None:
-        df = ds.ld_table(fid)
-        if df is None or df.empty:
+    # On charge UNE SEULE FOIS par ouverture de table.
+    # table_vis_df est le df stable passé à data_editor — il ne change PAS
+    # lors des reruns normaux, seulement lors d'actions explicites.
+    if st.session_state.table_df is None or st.session_state.table_fid != fid:
+        df_loaded = ds.ld_table(fid)
+        if df_loaded is None or df_loaded.empty:
             st.error("Table introuvable."); go_back(); st.rerun(); return
-        st.session_state.table_df = df
+        st.session_state.table_df = df_loaded
+        st.session_state.table_fid = fid
+        vis0 = [c for c in df_loaded.columns if c != "_location_"]
+        st.session_state.table_vis_df = df_loaded[vis0].copy().reset_index(drop=True)
         st.session_state.undo_stack = []
         st.session_state.redo_stack = []
 
@@ -1008,29 +1019,29 @@ def render_table():
                 ndf = ds.resize_table(fid, st.session_state.table_df,
                                       int(nr), int(nc))
                 st.session_state.table_df = ndf
+                vis2 = [c for c in ndf.columns if c != "_location_"]
+                st.session_state.table_vis_df = ndf[vis2].copy().reset_index(drop=True)
                 st.session_state.redo_stack = []
                 ds.sv_table(fid, ndf); st.rerun()
 
     st.markdown("---")
-    visible_df = df[vis].copy().reset_index(drop=True)
 
-    # ── on_change callback ────────────────────────────────────────────────────
-    # Streamlit appelle ce callback UNIQUEMENT lors d'une vraie modification
-    # utilisateur (Enter, Tab, clic hors cellule).
-    # Le callback reçoit le nouveau df via st.session_state[ekey] qui EST
-    # à jour au moment de l'appel du callback.
+    # ── Data editor avec df stable ────────────────────────────────────────────
+    # On passe TOUJOURS table_vis_df à data_editor (jamais recalculé depuis
+    # table_df lors d'un rerun). Cela empêche Streamlit de réinitialiser
+    # l'état interne du widget et d'effacer les éditions en cours.
+    #
+    # on_change applique le diff (edited_rows) sur table_df (source de vérité)
+    # ET met à jour table_vis_df pour refléter l'état réel.
     ekey = f"tbl_{fid}"
 
     def _on_change():
-        # st.session_state[ekey] est un dict Streamlit :
-        # {"edited_rows": {row_idx: {col: val}}, "added_rows": [], "deleted_rows": []}
-        # On applique ce diff sur la source de vérité (table_df).
         diff = st.session_state.get(ekey)
         if not isinstance(diff, dict): return
         edited_rows = diff.get("edited_rows", {})
-        if not edited_rows: return  # rien à faire
+        if not edited_rows: return
         _tpush_undo()
-        # Partir de la copie visible actuelle
+        # Appliquer le diff sur table_df
         base = st.session_state.table_df[vis].copy().reset_index(drop=True)
         for row_str, changes in edited_rows.items():
             try: row_idx = int(row_str)
@@ -1046,10 +1057,12 @@ def render_table():
         new_df.insert(0, "_location_", loc.values)
         st.session_state.table_df = new_df
         st.session_state.redo_stack = []
+        # Mettre à jour vis_df pour que le prochain render montre le bon état
+        st.session_state.table_vis_df = base.reset_index(drop=True)
         ds.sv_table(fid, new_df)
 
     st.data_editor(
-        visible_df,
+        st.session_state.table_vis_df,
         use_container_width=True,
         num_rows="fixed",
         key=ekey,
@@ -1059,7 +1072,7 @@ def render_table():
         on_change=_on_change,
     )
 
-    nr2, nc2 = visible_df.shape
+    nr2, nc2 = st.session_state.table_vis_df.shape
     st.markdown(
         f'<div style="font-size:.68rem;color:var(--t3);margin-top:5px;">'
         f'📐 {nr2}×{nc2} &nbsp;|&nbsp; ☁️ tables/{fid}.parquet</div>',
@@ -1075,17 +1088,20 @@ def _tpush_undo():
 
 def _tundo(ds, fid):
     if not st.session_state.undo_stack: return
-    st.session_state.redo_stack.append(
-        st.session_state.table_df.copy(deep=True))
+    st.session_state.redo_stack.append(st.session_state.table_df.copy(deep=True))
     st.session_state.table_df = st.session_state.undo_stack.pop()
+    # Sync vis_df
+    vis = [c for c in st.session_state.table_df.columns if c != "_location_"]
+    st.session_state.table_vis_df = st.session_state.table_df[vis].copy().reset_index(drop=True)
     ds.sv_table(fid, st.session_state.table_df)
 
 
 def _tredo(ds, fid):
     if not st.session_state.redo_stack: return
-    st.session_state.undo_stack.append(
-        st.session_state.table_df.copy(deep=True))
+    st.session_state.undo_stack.append(st.session_state.table_df.copy(deep=True))
     st.session_state.table_df = st.session_state.redo_stack.pop()
+    vis = [c for c in st.session_state.table_df.columns if c != "_location_"]
+    st.session_state.table_vis_df = st.session_state.table_df[vis].copy().reset_index(drop=True)
     ds.sv_table(fid, st.session_state.table_df)
 
 
@@ -1284,18 +1300,20 @@ function hitHandle(o,wx,wy){{
   return null;
 }}
 function minSize(o){{
-  // Taille minimale pour contenir le texte sans le couper.
-  // Utilise les mêmes constantes que wrapText/maxCharsForRect.
+  // Taille minimale en pixels MONDE pour contenir le texte.
+  // measureW() retourne des pixels CSS à sc=1 (canvas hors-écran).
+  // Puisque le canvas de mesure est à sc=1, mwCSS === pixels monde.
   if(!o.label||!o.label.length)return{{w:80,h:44}};
-  // Largeur du mot le plus long en pixels CSS réels
-  let mwCSS=0;
-  o.label.split(' ').forEach(w=>{{const m=measureW(w);if(m>mwCSS)mwCSS=m;}});
-  // On veut que la largeur monde satisfasse: (minW - PAD) * sc >= mwCSS
-  // → minW = mwCSS/sc + PAD (pixels monde)
-  const minW=Math.max(80,mwCSS/sc+PAD);
-  // Nombre de lignes nécessaires à cette largeur minimale
-  const lines=wrapText(o.label,minW-PAD);
-  const minH=Math.max(44,lines.length*LINE_H+PAD);
+  // Largeur du mot le plus long (pixels monde, sc indépendant)
+  let mwMonde=0;
+  o.label.split(' ').forEach(w=>{{
+    const m=measureW(w); // pixels CSS = pixels monde à sc=1
+    if(m>mwMonde)mwMonde=m;
+  }});
+  const minW=Math.max(80,mwMonde+PAD*2);
+  // Lignes nécessaires à cette largeur
+  const lines=wrapText(o.label,minW-PAD*2);
+  const minH=Math.max(44,lines.length*LINE_H+PAD*2);
   return{{w:minW,h:minH}};
 }}
 
@@ -1369,30 +1387,32 @@ function drawRect(o){{
   // Text (only when not in textarea editor)
   if(o.label&&!editing){{
     ctx.save();
-    // Police FIXE 13px pour cohérence avec le textarea
-    const FS=13;
-    ctx.font=FS+'px DM Mono,monospace';
+    ctx.font='13px DM Mono,monospace';
     ctx.fillStyle='#1e2e22';ctx.textAlign='center';ctx.textBaseline='middle';
-    // PAD et wrapText sont des globaux cohérents avec maxCharsForRect
-    const maxW=o.w-PAD;
-    const lines=wrapText(o.label,maxW);
-    const lh=FS*1.5,th=lines.length*lh;
-    const sy=o.y+o.h/2-th/2+lh/2;
+    // Zone de texte : PAD de chaque côté (pixels monde)
+    const textW=o.w-PAD*2;
+    const textH=o.h-PAD*2;
+    const lines=wrapText(o.label,textW);
+    const lh=LINE_H,th=lines.length*lh;
+    // Centrer verticalement dans la zone de texte
+    const sy=o.y+PAD+(textH-th)/2+lh/2;
     ctx.save();
-    // Clip strict à l'intérieur de la forme
+    // Clip exactement sur la zone de texte
     ctx.beginPath();
-    ctx.rect(o.x+PAD/2,o.y+PAD/2,o.w-PAD,o.h-PAD);
+    ctx.rect(o.x+PAD,o.y+PAD,textW,textH);
     ctx.clip();
     lines.forEach((l,i)=>ctx.fillText(l,o.x+o.w/2,sy+i*lh));
     ctx.restore();
-    // Char counter when selected (en dehors du clip)
+    // Char counter quand sélectionné
     if(sel){{
       const cnt=o.label.length;
       const cap=maxCharsForRect(o.w,o.h);
-      ctx.font=(8/sc)+'px DM Mono,monospace';
-      ctx.fillStyle=cnt>=cap?'#c0392b':'rgba(122,158,136,.8)';
+      ctx.save();
+      ctx.font=(9/sc)+'px DM Mono,monospace';
+      ctx.fillStyle=cnt>=cap?'#c0392b':'rgba(122,158,136,.75)';
       ctx.textAlign='center';ctx.textBaseline='top';
-      ctx.fillText(cnt+'/'+cap,o.x+o.w/2,o.y+o.h+3/sc);
+      ctx.fillText(cnt+'/'+cap,o.x+o.w/2,o.y+o.h+2/sc);
+      ctx.restore();
     }}
     ctx.restore();
   }}
@@ -1453,67 +1473,67 @@ function measureW(text){{
 
 // Wrap texte : maxW en pixels monde (coordonnées canvas).
 // On convertit en pixels CSS via sc pour la mesure.
-function wrapText(text,maxWworld){{
+// wrapText : maxW en pixels monde (= pixels CSS à sc=1, mesurés par _mCtx)
+// measureW() utilise le canvas hors-écran à sc=1 donc retourne des pixels monde.
+// Pas de multiplication par sc nécessaire.
+function wrapText(text,maxW){{
   if(!text)return[''];
-  // maxWworld est en pixels monde → en pixels CSS = maxWworld (indépendant du scale
-  // car measureText retourne en CSS et le canvas world est en CSS à scale=1)
-  // MAIS ctx est transformé par scale(sc,sc), donc 1 pixel monde = sc pixels CSS.
-  // ctx.measureText() ne tient PAS compte du transform → toujours CSS.
-  // Donc pour wrap en pixels monde : maxW_CSS = maxWworld * sc
-  const maxW=maxWworld*sc;
   const words=text.split(' ');const lines=[];let line='';
   for(const w of words){{
     const t=line?line+' '+w:w;
     if(measureW(t)>maxW&&line){{lines.push(line);line=w;}}
-    else{{line=t;}}
+    else line=t;
   }}
-  // Forcer le wrap des mots très longs (sans espace)
+  // Wrap des mots trop longs sans espace
+  const all=line?[...lines,line]:lines;
   const result=[];
-  for(const ln of (line?[...lines,line]:lines)){{
-    if(measureW(ln)>maxW){{
-      let cur='';
-      for(const ch of ln){{
-        if(measureW(cur+ch)>maxW&&cur){{result.push(cur);cur=ch;}}
-        else cur+=ch;
-      }}
-      if(cur)result.push(cur);
-    }}else{{
-      result.push(ln);
+  for(const ln of all){{
+    if(measureW(ln)<=maxW){{result.push(ln);continue;}}
+    let cur='';
+    for(const ch of ln){{
+      if(measureW(cur+ch)>maxW&&cur){{result.push(cur);cur=ch;}}
+      else cur+=ch;
     }}
+    if(cur)result.push(cur);
   }}
   return result.length?result:[''];
 }}
 
-// Padding intérieur fixe (pixels monde)
-const PAD=24;
-const CHAR_W_PX=6.2; // Largeur réelle DM Mono 13px (mesurée empiriquement) × 0.8 sécurité
-const LINE_H=19.5;   // 13px × 1.5
+// Constantes de mise en page (en pixels monde, indépendantes du zoom)
+const PAD=20;          // padding intérieur de chaque côté
+const CHAR_W_PX=6.0;   // DM Mono 13px : ~7.5px réel × 0.80 sécurité
+const LINE_H=20;       // 13px × 1.5 arrondi
 
-// Calcule la limite de caractères pour un rectangle en pixels monde.
+// Limite de caractères pour un rectangle de taille w×h (pixels monde).
 function maxCharsForRect(w,h){{
-  const cols=Math.max(1,Math.floor((w-PAD)/CHAR_W_PX));
-  const rows=Math.max(1,Math.floor((h-PAD)/LINE_H));
+  const cols=Math.max(1,Math.floor((w-PAD*2)/CHAR_W_PX));
+  const rows=Math.max(1,Math.floor((h-PAD*2)/LINE_H));
   return Math.max(4,Math.floor(cols*rows));
 }}
 
 // ── Textarea editor ────────────────────────────────────────────────────────
 function repositionTE(o){{
   const cx=o.x*sc+ox,cy=o.y*sc+oy;
-  const padPx=Math.round(PAD/2*sc);  // padding en pixels CSS (scalé)
+  const wPx=o.w*sc, hPx=o.h*sc;
+  const padPx=PAD*sc;
   te.style.left=cx+'px';te.style.top=cy+'px';
-  te.style.width=(o.w*sc)+'px';te.style.height=(o.h*sc)+'px';
-  te.style.fontSize=(13*sc)+'px';  // Police scalée pour correspondre au canvas
-  te.style.lineHeight='1.5';
+  te.style.width=wPx+'px';te.style.height=hPx+'px';
+  // Police et padding scalés pour que le textarea reflète exactement le canvas
+  te.style.fontSize=(13*sc)+'px';
+  te.style.lineHeight=(LINE_H*sc)+'px';
   te.style.padding=padPx+'px';
+  te.style.boxSizing='border-box';
   te.style.wordBreak='break-word';
   te.style.whiteSpace='pre-wrap';
   te.style.overflowWrap='break-word';
+  te.style.textAlign='center';
+  te.style.overflow='hidden';
   // Limite dynamique
   const cap=maxCharsForRect(o.w,o.h);
   te.maxLength=cap;
   const cnt=te.value.length;
-  cc.style.left=cx+'px';cc.style.top=(cy+o.h*sc+3)+'px';
-  cc.style.width=(o.w*sc)+'px';
+  cc.style.left=cx+'px';cc.style.top=(cy+hPx+3)+'px';
+  cc.style.width=wPx+'px';
   cc.style.color=cnt>=cap?'#c0392b':'#7a9e88';
   cc.textContent=cnt+'/'+cap;
 }}
