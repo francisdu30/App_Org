@@ -1022,12 +1022,25 @@ def render_table():
     ekey = f"tbl_{fid}"
 
     def _on_change():
-        # Au moment du callback, st.session_state[ekey] contient le nouveau df
-        new_edited = st.session_state.get(ekey)
-        if new_edited is None: return
+        # st.session_state[ekey] est un dict Streamlit :
+        # {"edited_rows": {row_idx: {col: val}}, "added_rows": [], "deleted_rows": []}
+        # On applique ce diff sur la source de vérité (table_df).
+        diff = st.session_state.get(ekey)
+        if not isinstance(diff, dict): return
+        edited_rows = diff.get("edited_rows", {})
+        if not edited_rows: return  # rien à faire
         _tpush_undo()
+        # Partir de la copie visible actuelle
+        base = st.session_state.table_df[vis].copy().reset_index(drop=True)
+        for row_str, changes in edited_rows.items():
+            try: row_idx = int(row_str)
+            except: continue
+            if row_idx >= len(base): continue
+            for col, val in changes.items():
+                if col in base.columns:
+                    base.at[row_idx, col] = "" if val is None else str(val)
         loc = st.session_state.table_df["_location_"].reset_index(drop=True)
-        new_df = new_edited.reset_index(drop=True).copy()
+        new_df = base.copy()
         if len(loc) != len(new_df):
             loc = loc.reindex(range(len(new_df))).fillna("")
         new_df.insert(0, "_location_", loc.values)
@@ -1108,7 +1121,7 @@ def _render_version_picker(ds: DataStore, fid: str, kind: str):
 #  La clé est de ne PAS utiliser postMessage vers le parent (iframe restrictions)
 #  mais d'utiliser un st.text_area comme canal de communication.
 # ══════════════════════════════════════════════════════════════════════════════
-MAX_CHARS = 500
+MAX_CHARS = 500  # absolue max global; la limite réelle est calculée par forme
 
 def _build_map_html(objs_json: str, fid: str, loc: str) -> str:
     """
@@ -1271,15 +1284,21 @@ function hitHandle(o,wx,wy){{
   return null;
 }}
 function minSize(o){{
+  // Taille minimale pour contenir le texte actuel sans le couper.
+  // Police fixe 13px DM Mono ≈ 7.8px/char, lh=19.5px, padding=16px
   if(!o.label||!o.label.length)return{{w:80,h:44}};
   ctx.save();ctx.font='13px DM Mono,monospace';
+  // Largeur du mot le plus long
   let mw=0;
   o.label.split(' ').forEach(w=>{{const m=ctx.measureText(w).width;if(m>mw)mw=m;}});
   ctx.restore();
-  return{{
-    w:Math.max(80,mw+28),
-    h:Math.max(44,Math.ceil(o.label.length*7/(mw||60))*20+20),
-  }};
+  const PAD=16;
+  const minW=Math.max(80,mw+PAD);
+  // Nombre de lignes si on wrap à minW
+  const charsPerLine=Math.max(1,Math.floor((minW-PAD)/7.8));
+  const nLines=Math.max(1,Math.ceil(o.label.length/charsPerLine));
+  const minH=Math.max(44,nLines*19.5+PAD);
+  return{{w:minW,h:minH}};
 }}
 
 // ── Undo/Redo ──────────────────────────────────────────────────────────────
@@ -1352,24 +1371,30 @@ function drawRect(o){{
   // Text (only when not in textarea editor)
   if(o.label&&!editing){{
     ctx.save();
-    const fs=Math.max(9,Math.min(14,o.w/12));
-    ctx.font=fs+'px DM Mono,monospace';
+    // Police FIXE 13px pour cohérence avec le textarea
+    const FS=13;
+    ctx.font=FS+'px DM Mono,monospace';
     ctx.fillStyle='#1e2e22';ctx.textAlign='center';ctx.textBaseline='middle';
-    const pad=Math.max(10,o.w*.08);
-    const lines=wrapText(ctx,o.label,o.w-pad*2);
-    const lh=fs*1.5,th=lines.length*lh;
+    const PAD=16;  // padding horizontal intérieur (pixels monde)
+    const maxW=o.w-PAD;
+    const lines=wrapText(ctx,o.label,maxW);
+    const lh=FS*1.5,th=lines.length*lh;
     const sy=o.y+o.h/2-th/2+lh/2;
     ctx.save();
-    ctx.beginPath();ctx.rect(o.x+3/sc,o.y+3/sc,o.w-6/sc,o.h-6/sc);ctx.clip();
+    // Clip strict à l'intérieur de la forme (avec padding)
+    ctx.beginPath();
+    ctx.rect(o.x+PAD/2,o.y+PAD/2,o.w-PAD,o.h-PAD);
+    ctx.clip();
     lines.forEach((l,i)=>ctx.fillText(l,o.x+o.w/2,sy+i*lh));
     ctx.restore();
-    // Char counter when selected
+    // Char counter when selected (en dehors du clip)
     if(sel){{
       const cnt=o.label.length;
+      const cap=maxCharsForRect(o.w,o.h);
       ctx.font=(8/sc)+'px DM Mono,monospace';
-      ctx.fillStyle=cnt>=MC?'#c0392b':'rgba(122,158,136,.8)';
+      ctx.fillStyle=cnt>=cap?'#c0392b':'rgba(122,158,136,.8)';
       ctx.textAlign='center';ctx.textBaseline='top';
-      ctx.fillText(cnt+'/'+MC,o.x+o.w/2,o.y+o.h+3/sc);
+      ctx.fillText(cnt+'/'+cap,o.x+o.w/2,o.y+o.h+3/sc);
     }}
     ctx.restore();
   }}
@@ -1420,13 +1445,27 @@ function rrPath(x,y,w,h,r){{
 }}
 function wrapText(ctx,text,maxW){{
   if(!text)return[''];
+  // Forcer une police cohérente avant de mesurer
+  ctx.font='13px DM Mono,monospace';
   const words=text.split(' ');const lines=[];let line='';
   for(const w of words){{
     const t=line?line+' '+w:w;
     if(ctx.measureText(t).width>maxW&&line){{lines.push(line);line=w;}}
-    else line=t;
+    else{{line=t;}}
   }}
   if(line)lines.push(line);return lines.length?lines:[''];
+}}
+
+// Calcule la limite de caractères pour un rectangle de taille donnée.
+// Police fixe DM Mono 13px : ~7.8px/char, line-height 19.5px, padding 16px H et V.
+function maxCharsForRect(w,h){{
+  const PAD=16;
+  const CHAR_W=7.8;   // largeur approx d'un caractère en pixels monde
+  const LINE_H=19.5;  // 13px * 1.5
+  const cols=Math.max(1,Math.floor((w-PAD)/CHAR_W));
+  const rows=Math.max(1,Math.floor((h-PAD)/LINE_H));
+  // Marge de sécurité 80% pour ne pas coller aux bords
+  return Math.max(10,Math.floor(cols*rows*0.80));
 }}
 
 // ── Textarea editor ────────────────────────────────────────────────────────
@@ -1434,19 +1473,24 @@ function repositionTE(o){{
   const cx=o.x*sc+ox,cy=o.y*sc+oy;
   te.style.left=cx+'px';te.style.top=cy+'px';
   te.style.width=(o.w*sc)+'px';te.style.height=(o.h*sc)+'px';
-  te.style.fontSize=Math.max(10,Math.min(14,o.w/12))+'px';
-  // Counter
+  te.style.fontSize='13px';  // Police FIXE — cohérente avec le rendu canvas
+  te.style.lineHeight='1.5';
+  te.style.padding='8px';
+  // Limite dynamique
+  const cap=maxCharsForRect(o.w,o.h);
+  te.maxLength=cap;
   const cnt=te.value.length;
   cc.style.left=cx+'px';cc.style.top=(cy+o.h*sc+3)+'px';
   cc.style.width=(o.w*sc)+'px';
-  cc.style.color=cnt>=MC?'#c0392b':'#7a9e88';
-  cc.textContent=cnt+'/'+MC;
+  cc.style.color=cnt>=cap?'#c0392b':'#7a9e88';
+  cc.textContent=cnt+'/'+cap;
 }}
 function openTE(o){{
   if(o.w2)return;  // not writable
   eid=o.id;
+  const cap=maxCharsForRect(o.w,o.h);
   te.value=o.label||'';
-  te.maxLength=MC;
+  te.maxLength=cap;  // Limite dynamique selon taille de la forme
   te.style.display='block';
   cc.style.display='block';
   repositionTE(o);
@@ -1642,7 +1686,7 @@ document.addEventListener('keydown',e=>{{
   if(selId&&e.key.length===1&&!e.ctrlKey&&!e.metaKey){{
     const o=objs.find(x=>x.id===selId);
     if(o&&o.type==='r'&&!o.w2){{
-      if((o.label||'').length>=MC)return;
+      if((o.label||'').length>=maxCharsForRect(o.w,o.h))return;
       openTE(o);
       te.value=(o.label||'')+e.key;
       o.label=te.value;
