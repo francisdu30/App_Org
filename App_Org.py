@@ -1297,28 +1297,22 @@ function hitHandle(o,wx,wy){{
     if(Math.abs(wx-h.x)<t&&Math.abs(wy-h.y)<t)return h.id;
   return null;
 }}
-// Taille minimale ABSOLUE d'un rectangle (pixels monde).
-// minW = largeur du mot le plus long + marges (ne peut pas aller en dessous).
-// minH = calculée selon la largeur COURANTE du rectangle (pas la minW),
-//        car si on rétrécit en largeur, le texte se wrap et prend plus de hauteur.
-function minW_forLabel(label){{
-  if(!label||!label.length)return 80;
-  let mw=0;
-  label.split(' ').forEach(w=>{{const m=measureW(w);if(m>mw)mw=m;}});
-  return Math.max(80,mw+PAD*2);
-}}
+// ── Tailles minimales ───────────────────────────────────────────────────────
+// La largeur min = MIN_RECT_W (toujours rétréci, wrapText coupe les mots).
+// La hauteur min dépend de la largeur courante (plus étroit = plus de lignes).
+const MIN_RECT_W=60;
+const MIN_RECT_H=40;
+
 function minH_forWidth(label,currentW){{
-  if(!label||!label.length)return 44;
+  if(!label||!label.length)return MIN_RECT_H;
   const textW=Math.max(1,currentW-PAD*2);
   const lines=wrapText(label,textW);
-  return Math.max(44,lines.length*LINE_H+PAD*2);
+  return Math.max(MIN_RECT_H,lines.length*LINE_H+PAD*2);
 }}
+
 function minSize(o){{
-  // minW absolu (basé sur le mot le plus long)
-  // minH calculé sur la largeur ACTUELLE de o (pas la minW)
-  const mw=minW_forLabel(o.label||'');
-  const mh=minH_forWidth(o.label||'',o.w);
-  return{{w:mw,h:mh}};
+  return{{w:MIN_RECT_W,h:minH_forWidth(o.label||'',o.w)}};
+}}
 }}
 
 // ── Undo/Redo ──────────────────────────────────────────────────────────────
@@ -1688,28 +1682,25 @@ cv.addEventListener('mousemove',e=>{{
     const o=objs.find(x=>x.id===selId);
     if(o){{
       const dx=wp.x-dsx,dy=wp.y-dsy;
-      const absMinW=minW_forLabel(o.label||'');
-
+      // Largeur min = MIN_RECT_W (wrapText coupe les mots longs char par char)
+      // On peut TOUJOURS rétrécir jusqu'à MIN_RECT_W
       if(rh.includes('e')){{
-        // Rétrécissement en largeur : autorisé jusqu'au mot le plus long
-        o.w=Math.max(absMinW,rs.w+dx);
-        // Ajuster la hauteur minimale selon la nouvelle largeur
-        const newMinH=minH_forWidth(o.label||'',o.w);
-        if(o.h<newMinH)o.h=newMinH;
+        o.w=Math.max(MIN_RECT_W,rs.w+dx);
+        const mh=minH_forWidth(o.label||'',o.w);
+        if(o.h<mh)o.h=mh;
       }}
       if(rh.includes('w')){{
-        const nw=Math.max(absMinW,rs.w-dx);
+        const nw=Math.max(MIN_RECT_W,rs.w-dx);
         o.x=rs.x+(rs.w-nw);o.w=nw;
-        const newMinH=minH_forWidth(o.label||'',o.w);
-        if(o.h<newMinH)o.h=newMinH;
+        const mh=minH_forWidth(o.label||'',o.w);
+        if(o.h<mh)o.h=mh;
       }}
       if(rh.includes('s')){{
-        const minH=minH_forWidth(o.label||'',o.w);
-        o.h=Math.max(minH,rs.h+dy);
+        o.h=Math.max(minH_forWidth(o.label||'',o.w),rs.h+dy);
       }}
       if(rh.includes('n')){{
-        const minH=minH_forWidth(o.label||'',o.w);
-        const nh=Math.max(minH,rs.h-dy);
+        const mh=minH_forWidth(o.label||'',o.w);
+        const nh=Math.max(mh,rs.h-dy);
         o.y=rs.y+(rs.h-nh);o.h=nh;
       }}
       syncArrows(o);
