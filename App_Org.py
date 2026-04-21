@@ -1223,7 +1223,12 @@ function inArrow(o,wx,wy){{
   const px=o.x1+t*dx,py=o.y1+t*dy;
   return Math.sqrt((wx-px)**2+(wy-py)**2)<10/sc;
 }}
-function hitAny(wx,wy){{for(let i=objs.length-1;i>=0;i--)if(inRect(objs[i],wx,wy)||inArrow(objs[i],wx,wy))return objs[i];return null;}}
+function hitAny(wx,wy){{
+  // Test les flèches en priorité, puis les rectangles
+  for(let i=objs.length-1;i>=0;i--)if(inArrow(objs[i],wx,wy))return objs[i];
+  for(let i=objs.length-1;i>=0;i--)if(inRect(objs[i],wx,wy))return objs[i];
+  return null;
+}}
 function hitRect(wx,wy){{for(let i=objs.length-1;i>=0;i--)if(inRect(objs[i],wx,wy))return objs[i];return null;}}
 function handles(o){{
   if(o.type!=='r')return[];
@@ -1276,10 +1281,13 @@ function saveNow(force){{
       return{{object_id:o.id,type:o.type==='r'?'rectangle':'arrow',
               label:o.label||'',coords:JSON.stringify(coords),writable:o.w2?'false':'true'}};
     }});
-    const payload=JSON.stringify({{fid:FID,loc:LOC,rows}});
-    try{{window.parent.postMessage({{mapdata:payload}},'*');}}catch(_){{}}
-    try{{sessionStorage.setItem('map_'+FID,payload);}}catch(_){{}}
-    stEl.textContent='&#10003;';setTimeout(()=>stEl.textContent='',1500);
+    const payload=JSON.stringify({{fid:FID,loc:LOC,rows,ts:Date.now()}});
+    // Stocker dans localStorage — lu par le bridge Streamlit
+    try{{
+      localStorage.setItem('streamlit_map_save',payload);
+      localStorage.setItem('streamlit_map_save_fid',FID);
+    }}catch(_){{}}
+    stEl.textContent='\u2713';setTimeout(()=>stEl.textContent='',1500);
   }},400);
 }}
 // Init autosave button state
@@ -1289,8 +1297,9 @@ if(autoSave)document.getElementById('btn_as').classList.add('on');
 function render(){{
   ctx.clearRect(0,0,cv.width,cv.height);
   ctx.save();ctx.translate(ox,oy);ctx.scale(sc,sc);
-  objs.filter(o=>o.type==='a').forEach(drawArrow);
+  // Rects d'abord, flèches par-dessus (pointes toujours visibles)
   objs.filter(o=>o.type==='r').forEach(drawRect);
+  objs.filter(o=>o.type==='a').forEach(drawArrow);
   if(drawing){{
     const w=dEnd.x-dSt.x,h=dEnd.y-dSt.y;
     ctx.save();ctx.strokeStyle='#4a7c59';ctx.fillStyle='rgba(74,124,89,.06)';
@@ -1343,24 +1352,30 @@ function drawRect(o){{
 function drawArrow(o){{
   const sel=(o.id===selId);
   const ang=Math.atan2(o.y2-o.y1,o.x2-o.x1);
-  const AH=18/sc;
-  // Ligne raccourcie pour laisser place à la pointe
-  const ex=o.x2-Math.cos(ang)*AH*.7,ey=o.y2-Math.sin(ang)*AH*.7;
+  const AH=22/sc; // taille pointe en pixels monde
+  // Ligne raccourcie pour laisser la pointe visible
+  const ex=o.x2-Math.cos(ang)*AH*0.75, ey=o.y2-Math.sin(ang)*AH*0.75;
   ctx.save();
-  ctx.strokeStyle=sel?'#3a6246':'#5a8c6a';ctx.lineWidth=(sel?3:2.5)/sc;ctx.lineCap='round';
+  // Ligne
+  ctx.strokeStyle=sel?'#2d4f38':'#4a7c59';
+  ctx.lineWidth=(sel?3.5:2.5)/sc;ctx.lineCap='round';
   ctx.beginPath();ctx.moveTo(o.x1,o.y1);ctx.lineTo(ex,ey);ctx.stroke();
-  // Pointe triangle solide
-  ctx.fillStyle=sel?'#2d4f38':'#4a7c59';
+  // Cercle de sélection au milieu
+  if(sel){{
+    ctx.fillStyle='rgba(74,124,89,.18)';
+    ctx.beginPath();ctx.arc((o.x1+o.x2)/2,(o.y1+o.y2)/2,10/sc,0,Math.PI*2);ctx.fill();
+  }}
+  // Pointe triangle — dessinée en dernier (au-dessus de la ligne)
+  ctx.fillStyle=sel?'#2d4f38':'#3a6246';
+  ctx.strokeStyle=sel?'#1e2e22':'#2d4f38';
+  ctx.lineWidth=0.8/sc;
   ctx.beginPath();
   ctx.moveTo(o.x2,o.y2);
-  ctx.lineTo(o.x2-AH*Math.cos(ang-.45),o.y2-AH*Math.sin(ang-.45));
-  ctx.lineTo(o.x2-AH*.5*Math.cos(ang),o.y2-AH*.5*Math.sin(ang));
-  ctx.lineTo(o.x2-AH*Math.cos(ang+.45),o.y2-AH*Math.sin(ang+.45));
-  ctx.closePath();ctx.fill();
-  if(sel){{
-    ctx.fillStyle='rgba(74,124,89,.2)';
-    ctx.beginPath();ctx.arc((o.x1+o.x2)/2,(o.y1+o.y2)/2,8/sc,0,Math.PI*2);ctx.fill();
-  }}
+  ctx.lineTo(o.x2-AH*Math.cos(ang-0.45),o.y2-AH*Math.sin(ang-0.45));
+  ctx.lineTo(o.x2-AH*0.5*Math.cos(ang),o.y2-AH*0.5*Math.sin(ang));
+  ctx.lineTo(o.x2-AH*Math.cos(ang+0.45),o.y2-AH*Math.sin(ang+0.45));
+  ctx.closePath();
+  ctx.fill();ctx.stroke();
   ctx.restore();
 }}
 
@@ -1567,69 +1582,64 @@ def render_map():
             'Ctrl+Z/Y: undo/redo | 💾 Sauvegarder → coller ci-dessous</div>',
             unsafe_allow_html=True)
 
-    # ── Canal de sauvegarde ────────────────────────────────────────────────
-    # Architecture robuste sans dépendance aux iframes cross-origin :
-    # 1) Le bouton 💾 dans le canvas exporte les données dans une textarea HTML
-    # 2) L'utilisateur copie/colle OU le navigateur déclenche l'auto-copie
-    # 3) Un st.text_area Streamlit reçoit les données et déclenche la sauvegarde R2
-    #
-    # Pour l'autosave sans copier-coller : le canvas envoie via postMessage
-    # et un composant HTML bridge tente de l'injecter dans le text_area Streamlit.
+    # ── Bridge localStorage → Streamlit ─────────────────────────────────────
+    # Le canvas écrit dans localStorage. Ce bridge polls et sauvegarde via R2.
+    bridge_html = f"""<script>
+    (function(){{
+      const KEY='streamlit_map_save', FIDK='streamlit_map_save_fid';
+      const TFID='{fid}'; let lastTs=null;
+      function inject(data){{
+        try{{
+          const inputs=window.parent.document.querySelectorAll('input[data-mapsink]');
+          if(!inputs.length)return false;
+          const inp=inputs[0];
+          const setter=Object.getOwnPropertyDescriptor(window.parent.HTMLInputElement.prototype,'value');
+          setter.set.call(inp,data);
+          inp.dispatchEvent(new Event('input',{{bubbles:true}}));
+          inp.dispatchEvent(new Event('change',{{bubbles:true}}));
+          return true;
+        }}catch(e){{return false;}}
+      }}
+      function tag(){{
+        const doc=window.parent.document;
+        const all=doc.querySelectorAll('input[type=text]');
+        all.forEach(inp=>{{
+          if(!inp.getAttribute('data-mapsink')&&inp.value===''&&inp.style.display!=='none')
+            inp.setAttribute('data-mapsink','1');
+        }});
+      }}
+      function poll(){{
+        tag();
+        try{{
+          if(localStorage.getItem(FIDK)!==TFID)return;
+          const raw=localStorage.getItem(KEY);if(!raw)return;
+          const d=JSON.parse(raw);if(d.ts===lastTs)return;
+          lastTs=d.ts;
+          if(inject(raw)){{localStorage.removeItem(KEY);localStorage.removeItem(FIDK);}}
+        }}catch(e){{}}
+      }}
+      setInterval(poll,300);
+    }})();
+    </script>"""
+    components.html(bridge_html, height=0)
 
-    pending = st.session_state.get("map_pending_save")
-    if pending:
+    def _on_map_input():
+        raw = st.session_state.get(f"mapsink_{fid}", "")
+        if not raw or not raw.strip().startswith("{"): return
         try:
-            payload = json.loads(pending)
-            if payload.get("fid") == fid:
-                _save_map_from_payload(ds, fid, loc, payload)
-                st.session_state.map_pending_save = None
-                st.toast("Map sauvegardée ✓", icon="✅")
+            p = json.loads(raw.strip())
+            if p.get("fid") == fid:
+                _save_map_from_payload(ds, fid, loc, p)
+                st.session_state[f"mapsink_{fid}"] = ""
         except: pass
 
-    # Composant bridge qui écoute postMessage du canvas
-    bridge = f"""<script>
-    window.addEventListener('message',function(e){{
-      if(!e.data||!e.data.mapdata)return;
-      try{{
-        // Trouve le text_area Streamlit et y injecte les données
-        const tas=window.parent.document.querySelectorAll('textarea');
-        for(const ta of tas){{
-          if(ta.placeholder&&ta.placeholder.includes('__mapsave_')){{
-            const setter=Object.getOwnPropertyDescriptor(
-              window.parent.HTMLTextAreaElement.prototype,'value');
-            setter.set.call(ta,e.data.mapdata);
-            ta.dispatchEvent(new Event('input',{{bubbles:true}}));
-            break;
-          }}
-        }}
-      }}catch(err){{}}
-    }});
-    </script>"""
-    components.html(bridge, height=0)
-
-    # Zone de saisie des données exportées
-    with st.expander("💾 Sauvegarder la map", expanded=False):
-        st.markdown(
-            '<span style="font-size:.75rem;color:var(--t3);">'
-            'Cliquer le bouton **💾 Sauvegarder** dans le canvas, '
-            'puis coller ici si la sauvegarde automatique ne s\'est '
-            'pas déclenchée.</span>', unsafe_allow_html=True)
-        raw = st.text_area(
-            "", key=f"mraw_{fid}",
-            placeholder=f"__mapsave_{fid}__",
-            height=60, label_visibility="collapsed")
-        if raw and raw.strip().startswith("{"):
-            try:
-                payload = json.loads(raw.strip())
-                if payload.get("fid") == fid:
-                    _save_map_from_payload(ds, fid, loc, payload)
-                    st.success("Map sauvegardée !")
-            except Exception as ex:
-                st.error(f"Erreur : {ex}")
+    st.text_input("", key=f"mapsink_{fid}",
+                  label_visibility="collapsed",
+                  on_change=_on_map_input,
+                  placeholder="map-data-sink")
 
     # Canvas
-    components.html(_build_map_html(objs_json, fid, loc),
-                    height=650, scrolling=False)
+    components.html(_build_map_html(objs_json, fid, loc), height=650, scrolling=False)
 
     st.markdown(
         '<div style="font-size:.65rem;color:var(--t3);margin-top:4px;">'
