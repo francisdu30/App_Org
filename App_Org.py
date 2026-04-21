@@ -590,11 +590,6 @@ def _trunc(s: str, n: int = 16) -> str:
 
 
 def _render_tree(ds, user, nodes, depth, parent_last, max_depth=2):
-    """
-    Rendu de l'arborescence.
-    Branches visuelles en HTML pur via st.markdown AVANT les colonnes de boutons.
-    Les boutons eux-mêmes n'ont AUCUN texte de branche.
-    """
     cc = st.session_state.get("current_cat_id")
     n = len(nodes)
     for idx, node in enumerate(nodes):
@@ -603,58 +598,43 @@ def _render_tree(ds, user, nodes, depth, parent_last, max_depth=2):
         collapsed = node.get("collapsed", False)
         sel = cc == nid; is_last = (idx == n - 1)
         has_kids = bool(kids) and depth < max_depth
-        icon = "📁" if kids else "📂"
-
-        # ── Branche SVG séparée des boutons ──────────────────────────────────
+        # Icone et style selon profondeur
+        if depth == 0:
+            icon = "◆" if kids else "◇"
+        elif depth == 1:
+            icon = "▸" if kids else "·"
+        else:
+            icon = "·"
+        # Préfixe branche unicode — affiché hors bouton
         if depth > 0:
-            # Construction SVG
-            svg_w = depth * 14 + 20
-            svg_h = 30
-            lines = []
-            # Lignes verticales des ancêtres
-            for lvl, pl in enumerate(parent_last):
-                x = 7 + lvl * 14
-                if not pl:
-                    lines.append(
-                        f'<line x1="{x}" y1="0" x2="{x}" y2="{svg_h}" '
-                        f'stroke="#c8dbc0" stroke-width="1.5"/>')
-            # Branche du nœud courant
-            cx = 7 + (depth - 1) * 14
-            bot = svg_h // 2 if is_last else svg_h
-            lines.append(f'<line x1="{cx}" y1="0" x2="{cx}" y2="{bot}" '
-                         f'stroke="#c8dbc0" stroke-width="1.5"/>')
-            lines.append(f'<line x1="{cx}" y1="{svg_h//2}" x2="{cx+14}" '
-                         f'y2="{svg_h//2}" stroke="#c8dbc0" stroke-width="1.5"/>')
-            lines.append(f'<circle cx="{cx+14}" cy="{svg_h//2}" r="3" '
-                         f'fill="#4a7c59" opacity="0.7"/>')
-            svg = (f'<svg width="{svg_w}" height="{svg_h}" '
-                   f'style="display:block;margin-bottom:-4px;">'
-                   + "".join(lines) + "</svg>")
-            st.markdown(svg, unsafe_allow_html=True)
-
-        # ── Boutons sans branche dans leur label ──────────────────────────────
+            pre = ""
+            for pl in parent_last:
+                pre += "    " if pl else "│   "
+            br = "└── " if is_last else "├── "
+            branch_div = (
+                '<div style="line-height:1.2;padding:0 0 0 4px;margin-bottom:-4px;'
+                'font-family:DM Mono,monospace;font-size:.70rem;color:#c8dbc0;'
+                'letter-spacing:0;white-space:pre;">' + pre + br + '</div>'
+            )
+            st.markdown(branch_div, unsafe_allow_html=True)
         label = f"{icon} {_trunc(name)}"
         if has_kids:
-            c_tog, c_nom, c_pop = st.columns([0.11, 0.74, 0.15])
+            c_tog, c_nom, c_pop = st.columns([0.10, 0.75, 0.15])
             with c_tog:
                 lbl = "▶" if collapsed else "▼"
                 if st.button(lbl, key=f"tgl_{nid}", use_container_width=True):
                     ds.tog_col(user, nid); st.rerun()
         else:
             c_nom, c_pop = st.columns([0.85, 0.15])
-
         with c_nom:
             if st.button(label, key=f"cat_{nid}",
                          type="primary" if sel else "secondary",
                          use_container_width=True):
                 set_cat(nid); st.rerun()
-
         with c_pop:
             _cat_menu(ds, user, nid, name, cc)
-
         if has_kids and not collapsed:
             _render_tree(ds, user, kids, depth + 1, parent_last + [is_last])
-
 
 def _cat_menu(ds, user, nid, name, current_cat):
     with st.popover("⋯"):
@@ -1137,133 +1117,103 @@ def _render_version_picker(ds: DataStore, fid: str, kind: str):
 # ══════════════════════════════════════════════════════════════════════════════
 MAX_CHARS = 500  # absolue max global; la limite réelle est calculée par forme
 
-def _build_map_html(objs_json: str, fid: str, loc: str) -> str:
-    """
-    Canvas HTML5 complet et autonome.
-    Communication avec Streamlit :
-    - Le canvas écrit ses données sérialisées dans un textarea HTML DANS le même
-      composant (pas cross-iframe).
-    - Un bouton Streamlit en dehors lit ce textarea via st.text_area et sauvegarde.
-    - Pour l'autosave : on utilise sessionStorage comme buffer, et le canvas
-      expose une fonction window.getMapData() que le bridge peut appeler.
-    """
+def _build_map_html(objs_json: str, fid: str, loc: str, autosave: bool = True) -> str:
+    as_js = "true" if autosave else "false"
     return f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
 <style>
 *{{box-sizing:border-box;margin:0;padding:0;}}
 html,body{{width:100%;height:100%;overflow:hidden;background:#f4f7f2;
-  font-family:'DM Mono',monospace;color:#1e2e22;user-select:none;}}
-#tb{{display:flex;align-items:center;gap:4px;padding:6px 10px;
-  background:#eef3ea;border-bottom:1.5px solid #c8dbc0;flex-wrap:wrap;}}
-.tb{{padding:4px 10px;border-radius:6px;border:1.5px solid #c8dbc0;
-  background:#fff;color:#4a6657;font-size:.72rem;cursor:pointer;
+  font-family:'DM Mono',monospace;user-select:none;}}
+#tb{{display:flex;align-items:center;gap:4px;padding:5px 8px;
+  background:#eef3ea;border-bottom:1.5px solid #c8dbc0;flex-wrap:wrap;min-height:40px;}}
+.tb{{padding:3px 9px;border-radius:6px;border:1.5px solid #c8dbc0;
+  background:#fff;color:#4a6657;font-size:.70rem;cursor:pointer;
   font-family:inherit;transition:all .15s;white-space:nowrap;}}
 .tb:hover{{border-color:#4a7c59;color:#4a7c59;background:#f0f8f2;}}
-.tb.on{{border-color:#4a7c59;background:#dff0e2;color:#3a6246;font-weight:500;}}
-.sep{{width:1px;height:16px;background:#c8dbc0;margin:0 2px;flex-shrink:0;}}
-#zd{{font-size:.65rem;color:#7a9e88;min-width:34px;text-align:center;}}
-#hint{{font-size:.62rem;color:#7a9e88;flex:1;margin-left:4px;}}
-#st{{font-size:.62rem;color:#4a7c59;font-weight:500;}}
+.tb.on{{border-color:#4a7c59;background:#dff0e2;color:#3a6246;font-weight:600;}}
+.sep{{width:1px;height:14px;background:#c8dbc0;margin:0 2px;flex-shrink:0;}}
+#zd{{font-size:.63rem;color:#7a9e88;min-width:32px;text-align:center;}}
+#hint{{font-size:.60rem;color:#7a9e88;flex:1;margin-left:4px;overflow:hidden;white-space:nowrap;}}
+#st{{font-size:.60rem;color:#4a7c59;font-weight:600;margin-left:4px;}}
 #cw{{position:relative;overflow:hidden;background:#f8faf6;
   background-image:radial-gradient(circle,#d4e6cc 1px,transparent 1px);
   background-size:24px 24px;}}
-canvas{{display:block;}}
+canvas{{display:block;cursor:default;}}
 #te{{position:absolute;display:none;background:rgba(255,255,255,.97);
   color:#1e2e22;font-family:'DM Mono',monospace;resize:none;outline:none;
-  padding:6px;overflow:hidden;text-align:center;line-height:1.45;
+  overflow:hidden;text-align:center;
   border:2px solid #4a7c59;border-radius:6px;
   box-shadow:0 3px 16px rgba(74,124,89,.18);}}
-#cc{{position:absolute;display:none;font-size:.55rem;color:#7a9e88;
-  pointer-events:none;text-align:center;background:transparent;}}
-#ah{{position:absolute;top:6px;right:10px;font-size:.65rem;color:#4a7c59;
-  background:rgba(74,124,89,.12);padding:3px 8px;border-radius:5px;
+#cc{{position:absolute;display:none;font-size:.52rem;color:#7a9e88;
+  pointer-events:none;text-align:center;}}
+#ah{{position:absolute;top:5px;right:8px;font-size:.62rem;color:#4a7c59;
+  background:rgba(74,124,89,.12);padding:2px 7px;border-radius:5px;
   display:none;pointer-events:none;}}
-#data-out{{display:none;}}
 </style></head><body>
 <div id="tb">
-  <button class="tb on" id="bs" onclick="setTool('s')">↖ Sél.</button>
-  <button class="tb" id="br" onclick="setTool('r')">▭ Rect.</button>
-  <button class="tb" id="ba" onclick="setTool('a')">→ Flèche</button>
+  <button class="tb on" id="bs" onclick="setTool('s')">&#8598; Sél.</button>
+  <button class="tb" id="br" onclick="setTool('r')">&#9645; Rect.</button>
+  <button class="tb" id="ba" onclick="setTool('a')">&#8594; Flèche</button>
   <div class="sep"></div>
-  <button class="tb" onclick="zoom(.15)">+</button>
+  <button class="tb" onclick="zoom(.15)">&#43;</button>
   <div id="zd">100%</div>
-  <button class="tb" onclick="zoom(-.15)">−</button>
-  <button class="tb" onclick="resetView()">⊡</button>
+  <button class="tb" onclick="zoom(-.15)">&#8722;</button>
+  <button class="tb" onclick="resetView()">&#8855;</button>
   <div class="sep"></div>
-  <button class="tb" onclick="doUndo()">↩</button>
-  <button class="tb" onclick="doRedo()">↪</button>
+  <button class="tb" onclick="doUndo()">&#8617;</button>
+  <button class="tb" onclick="doRedo()">&#8618;</button>
   <div class="sep"></div>
-  <button class="tb" id="bw" onclick="toggleW()">✎ OUI</button>
+  <button class="tb" onclick="delSel()">&#128465;</button>
   <div class="sep"></div>
-  <button class="tb" onclick="delSel()">🗑</button>
-  <div class="sep"></div>
-  <button class="tb" onclick="exportData()" style="background:#dff0e2;color:#3a6246;border-color:#4a7c59;">💾 Sauvegarder</button>
-  <span id="hint">Alt+drag=pan • Ctrl+Z=undo</span>
+  <button class="tb" id="btn_as" onclick="toggleAS()">&#128190; Auto</button>
+  <button class="tb" onclick="saveNow(true)" style="border-color:#4a7c59;color:#3a6246;background:#edfaf0;">&#128190; Sauv.</button>
+  <span id="hint">Alt+drag: pan | Ctrl+Z/Y: undo/redo | Suppr: effacer</span>
   <span id="st"></span>
 </div>
 <div id="cw">
   <canvas id="cv"></canvas>
-  <textarea id="te" maxlength="{MAX_CHARS}"></textarea>
+  <textarea id="te"></textarea>
   <div id="cc"></div>
-  <div id="ah">→ Cliquer la cible</div>
+  <div id="ah">&#8594; cliquer la cible</div>
 </div>
-<textarea id="data-out" readonly></textarea>
-
 <script>
-// ── State ──────────────────────────────────────────────────────────────────
-const cv=document.getElementById('cv');
-const ctx=cv.getContext('2d');
-const cw=document.getElementById('cw');
-const te=document.getElementById('te');
-const cc=document.getElementById('cc');
-const ah=document.getElementById('ah');
-const stEl=document.getElementById('st');
-const hintEl=document.getElementById('hint');
-const bw=document.getElementById('bw');
-const dataOut=document.getElementById('data-out');
-
-const MC={MAX_CHARS};
-const FID="{fid}";
-const LOC="{loc}";
+const cv=document.getElementById('cv'),ctx=cv.getContext('2d');
+const cw=document.getElementById('cw'),te=document.getElementById('te');
+const cc=document.getElementById('cc'),ah=document.getElementById('ah');
+const stEl=document.getElementById('st'),hintEl=document.getElementById('hint');
+const FID="{fid}",LOC="{loc}";
+const PAD=20,LINE_H=20,MIN_W=60,MIN_H=40,CHAR_W=6.0;
 
 let objs={objs_json};
-let tool='s';
-let sc=1,ox=60,oy=60;
-let selId=null;
-let eid=null;       // id de l'objet en cours d'édition dans le textarea
+let tool='s',sc=1,ox=60,oy=60;
+let selId=null,eid=null,asrc=null,idc=1;
 let drag=false,dsx=0,dsy=0,dox=0,doy=0;
 let rsz=false,rh=null,rs=null;
-let drawing=false,drawSt={{x:0,y:0}},drawEnd={{x:0,y:0}};
+let drawing=false,dSt={{x:0,y:0}},dEnd={{x:0,y:0}};
 let pan=false,panX=0,panY=0,panOX=0,panOY=0;
-let asrc=null;
 let undoSt=[],redoSt=[];
-let idc=1;
-objs.forEach(o=>{{
-  const n=parseInt(String(o.id).replace(/[^0-9]/g,''))||0;
-  if(n>=idc)idc=n+1;
-}});
+let autoSave={as_js};
+let _saveTimer=null;
 
-// ── Resize canvas ──────────────────────────────────────────────────────────
+objs.forEach(o=>{{const n=parseInt(String(o.id).replace(/[^0-9]/g,''))||0;if(n>=idc)idc=n+1;}});
+
+// Measure canvas (always sc=1)
+const mCtx=(()=>{{const c=document.createElement('canvas');c.width=2;c.height=2;
+  const x=c.getContext('2d');x.font='13px DM Mono,monospace';return x;}})();
+function mW(t){{mCtx.font='13px DM Mono,monospace';return mCtx.measureText(t).width;}}
+
 function resize(){{
   const tbH=document.getElementById('tb').offsetHeight;
   cw.style.height=(window.innerHeight-tbH)+'px';
-  cv.width=cw.clientWidth;
-  cv.height=cw.clientHeight;
-  render();
+  cv.width=cw.clientWidth;cv.height=cw.clientHeight;render();
 }}
-window.addEventListener('resize',resize);
-resize();
+window.addEventListener('resize',resize);resize();
 
-// ── Coord helpers ──────────────────────────────────────────────────────────
 function tw(cx,cy){{return{{x:(cx-ox)/sc,y:(cy-oy)/sc}};}}
-function gp(e){{
-  const r=cv.getBoundingClientRect();
-  return{{x:e.clientX-r.left,y:e.clientY-r.top}};
-}}
+function gp(e){{const r=cv.getBoundingClientRect();return{{x:e.clientX-r.left,y:e.clientY-r.top}};}}
 
-// ── Hit testing ────────────────────────────────────────────────────────────
-function inRect(o,wx,wy){{
-  return o.type==='r'&&wx>=o.x&&wx<=o.x+o.w&&wy>=o.y&&wy<=o.y+o.h;
-}}
+// Hit testing
+function inRect(o,wx,wy){{return o.type==='r'&&wx>=o.x&&wx<=o.x+o.w&&wy>=o.y&&wy<=o.y+o.h;}}
 function inArrow(o,wx,wy){{
   if(o.type!=='a')return false;
   const dx=o.x2-o.x1,dy=o.y2-o.y1,L=Math.sqrt(dx*dx+dy*dy);
@@ -1271,151 +1221,114 @@ function inArrow(o,wx,wy){{
   const t=((wx-o.x1)*dx+(wy-o.y1)*dy)/(L*L);
   if(t<0||t>1)return false;
   const px=o.x1+t*dx,py=o.y1+t*dy;
-  return Math.sqrt((wx-px)**2+(wy-py)**2)<8/sc;
+  return Math.sqrt((wx-px)**2+(wy-py)**2)<10/sc;
 }}
-function hitAny(wx,wy){{
-  for(let i=objs.length-1;i>=0;i--)
-    if(inRect(objs[i],wx,wy)||inArrow(objs[i],wx,wy))return objs[i];
-  return null;
-}}
-function hitRect(wx,wy){{
-  for(let i=objs.length-1;i>=0;i--)
-    if(inRect(objs[i],wx,wy))return objs[i];
-  return null;
-}}
+function hitAny(wx,wy){{for(let i=objs.length-1;i>=0;i--)if(inRect(objs[i],wx,wy)||inArrow(objs[i],wx,wy))return objs[i];return null;}}
+function hitRect(wx,wy){{for(let i=objs.length-1;i>=0;i--)if(inRect(objs[i],wx,wy))return objs[i];return null;}}
 function handles(o){{
   if(o.type!=='r')return[];
-  return[
-    {{id:'se',x:o.x+o.w,y:o.y+o.h}},{{id:'e',x:o.x+o.w,y:o.y+o.h/2}},
-    {{id:'s',x:o.x+o.w/2,y:o.y+o.h}},{{id:'n',x:o.x+o.w/2,y:o.y}},
-    {{id:'nw',x:o.x,y:o.y}},{{id:'w',x:o.x,y:o.y+o.h/2}},
-  ];
+  return[{{id:'se',x:o.x+o.w,y:o.y+o.h}},{{id:'e',x:o.x+o.w,y:o.y+o.h/2}},
+         {{id:'s',x:o.x+o.w/2,y:o.y+o.h}},{{id:'n',x:o.x+o.w/2,y:o.y}},
+         {{id:'nw',x:o.x,y:o.y}},{{id:'w',x:o.x,y:o.y+o.h/2}}];
 }}
 function hitHandle(o,wx,wy){{
-  const t=7/sc;
-  for(const h of handles(o))
-    if(Math.abs(wx-h.x)<t&&Math.abs(wy-h.y)<t)return h.id;
+  const t=8/sc;
+  for(const h of handles(o))if(Math.abs(wx-h.x)<t&&Math.abs(wy-h.y)<t)return h.id;
   return null;
 }}
-// Taille minimale ABSOLUE d'un rectangle (pixels monde).
-// minW = largeur du mot le plus long + marges (ne peut pas aller en dessous).
-// minH = calculée selon la largeur COURANTE du rectangle (pas la minW),
-//        car si on rétrécit en largeur, le texte se wrap et prend plus de hauteur.
-// MIN_RECT_W : minimum absolu (wrapText coupe tout mot char par char)
-const MIN_RECT_W=60;
-const MIN_RECT_H=40;
 
-function minH_forWidth(label,currentW){{
-  if(!label||!label.length)return MIN_RECT_H;
-  const textW=Math.max(1,currentW-PAD*2);
-  const lines=wrapText(label,textW);
-  return Math.max(MIN_RECT_H,lines.length*LINE_H+PAD*2);
+// Text
+function wrapText(text,maxW){{
+  if(!text)return[''];
+  const words=text.split(' ');const lines=[];let line='';
+  for(const w of words){{const t=line?line+' '+w:w;if(mW(t)>maxW&&line){{lines.push(line);line=w;}}else line=t;}}
+  const all=line?[...lines,line]:lines;const result=[];
+  for(const ln of all){{
+    if(mW(ln)<=maxW){{result.push(ln);continue;}}
+    let cur='';for(const ch of ln){{if(mW(cur+ch)>maxW&&cur){{result.push(cur);cur=ch;}}else cur+=ch;}}
+    if(cur)result.push(cur);
+  }}
+  return result.length?result:[''];
 }}
-function minSize(o){{
-  return{{w:MIN_RECT_W,h:minH_forWidth(o.label||'',o.w)}};
-}}
+function maxChars(w,h){{return Math.max(4,Math.floor(Math.max(1,(w-PAD*2)/CHAR_W)*Math.max(1,(h-PAD*2)/LINE_H)));}}
+function minHforW(label,w){{if(!label)return MIN_H;return Math.max(MIN_H,wrapText(label,Math.max(1,w-PAD*2)).length*LINE_H+PAD*2);}}
 
-// ── Undo/Redo ──────────────────────────────────────────────────────────────
-function pushU(){{
-  undoSt.push(JSON.stringify(objs));
-  if(undoSt.length>50)undoSt.shift();
-  redoSt=[];
-}}
-function doUndo(){{
-  if(!undoSt.length)return;
-  redoSt.push(JSON.stringify(objs));
-  objs=JSON.parse(undoSt.pop());
-  selId=null;render();
-}}
-function doRedo(){{
-  if(!redoSt.length)return;
-  undoSt.push(JSON.stringify(objs));
-  objs=JSON.parse(redoSt.pop());
-  selId=null;render();
-}}
+// Undo/Redo
+function pushU(){{undoSt.push(JSON.stringify(objs));if(undoSt.length>50)undoSt.shift();redoSt=[];}}
+function doUndo(){{if(!undoSt.length)return;redoSt.push(JSON.stringify(objs));objs=JSON.parse(undoSt.pop());selId=null;render();}}
+function doRedo(){{if(!redoSt.length)return;undoSt.push(JSON.stringify(objs));objs=JSON.parse(redoSt.pop());selId=null;render();}}
 
-// ── Writable ───────────────────────────────────────────────────────────────
-function toggleW(){{
-  const o=objs.find(x=>x.id===selId);
-  if(!o||o.type!=='r')return;
-  o.w2=!o.w2;updateWBtn();render();
+// Autosave
+function toggleAS(){{
+  autoSave=!autoSave;
+  document.getElementById('btn_as').classList.toggle('on',autoSave);
+  stEl.textContent=autoSave?'Auto ON':'Auto OFF';setTimeout(()=>stEl.textContent='',2000);
 }}
-function updateWBtn(){{
-  const o=objs.find(x=>x.id===selId);
-  bw.textContent='✎ '+((!o||o.type!=='r')?'—':o.w2?'NON':'OUI');
+function saveNow(force){{
+  if(!force&&!autoSave)return;
+  clearTimeout(_saveTimer);
+  _saveTimer=setTimeout(()=>{{
+    if(eid!==null){{const o=objs.find(x=>x.id===eid);if(o)o.label=te.value;}}
+    const rows=objs.map(o=>{{
+      let coords={{}};
+      if(o.type==='r')coords={{x:o.x,y:o.y,w:o.w,h:o.h}};
+      else coords={{x1:o.x1,y1:o.y1,x2:o.x2,y2:o.y2,srcId:o.srcId,dstId:o.dstId}};
+      return{{object_id:o.id,type:o.type==='r'?'rectangle':'arrow',
+              label:o.label||'',coords:JSON.stringify(coords),writable:o.w2?'false':'true'}};
+    }});
+    const payload=JSON.stringify({{fid:FID,loc:LOC,rows}});
+    try{{window.parent.postMessage({{mapdata:payload}},'*');}}catch(_){{}}
+    try{{sessionStorage.setItem('map_'+FID,payload);}}catch(_){{}}
+    stEl.textContent='&#10003;';setTimeout(()=>stEl.textContent='',1500);
+  }},400);
 }}
+// Init autosave button state
+if(autoSave)document.getElementById('btn_as').classList.add('on');
 
-// ── Render ─────────────────────────────────────────────────────────────────
+// Render
 function render(){{
   ctx.clearRect(0,0,cv.width,cv.height);
   ctx.save();ctx.translate(ox,oy);ctx.scale(sc,sc);
-  // Arrows under rects
   objs.filter(o=>o.type==='a').forEach(drawArrow);
   objs.filter(o=>o.type==='r').forEach(drawRect);
-  // Draw preview
   if(drawing){{
-    const w=drawEnd.x-drawSt.x,h=drawEnd.y-drawSt.y;
-    ctx.save();
-    ctx.strokeStyle='#4a7c59';ctx.fillStyle='rgba(74,124,89,.06)';
+    const w=dEnd.x-dSt.x,h=dEnd.y-dSt.y;
+    ctx.save();ctx.strokeStyle='#4a7c59';ctx.fillStyle='rgba(74,124,89,.06)';
     ctx.lineWidth=1.5/sc;ctx.setLineDash([5/sc,3/sc]);
-    rrPath(drawSt.x,drawSt.y,w,h,6/sc);ctx.fill();ctx.stroke();
-    ctx.restore();
+    rrP(dSt.x,dSt.y,w,h,6/sc);ctx.fill();ctx.stroke();ctx.restore();
   }}
   ctx.restore();
   document.getElementById('zd').textContent=Math.round(sc*100)+'%';
-  // Update textarea overlay position if editing
-  if(eid!==null){{
-    const o=objs.find(x=>x.id===eid);
-    if(o)repositionTE(o);
-  }}
+  if(eid!==null){{const o=objs.find(x=>x.id===eid);if(o)reposTE(o);}}
 }}
 
 function drawRect(o){{
-  const sel=(o.id===selId);
-  const editing=(o.id===eid);
+  const sel=(o.id===selId),editing=(o.id===eid);
   ctx.save();
   if(sel&&!editing){{ctx.shadowColor='rgba(74,124,89,.35)';ctx.shadowBlur=12/sc;}}
-  // Fill: transparent if editing (textarea overlay covers it)
-  ctx.fillStyle=editing?'rgba(255,255,255,0)':'#ffffff';
+  ctx.fillStyle=editing?'rgba(255,255,255,0)':'#fff';
   ctx.strokeStyle=sel||editing?'#4a7c59':(o.w2?'#a0b8a0':'#c8dbc0');
   ctx.lineWidth=(sel||editing?2:1.5)/sc;
-  if(o.w2&&!sel){{ctx.setLineDash([4/sc,2/sc]);}}
-  ctx.beginPath();rrPath(o.x,o.y,o.w,o.h,8/sc);ctx.fill();ctx.stroke();
-  ctx.setLineDash([]);
-  // Text (only when not in textarea editor)
+  if(o.w2&&!sel)ctx.setLineDash([4/sc,2/sc]);
+  ctx.beginPath();rrP(o.x,o.y,o.w,o.h,8/sc);ctx.fill();ctx.stroke();ctx.setLineDash([]);
   if(o.label&&!editing){{
-    ctx.save();
-    // Police en pixels monde : 13/sc car ctx est dans un scale(sc,sc)
-    ctx.font=(13/sc)+'px DM Mono,monospace';
+    ctx.save();ctx.font=(13/sc)+'px DM Mono,monospace';
     ctx.fillStyle='#1e2e22';ctx.textAlign='center';ctx.textBaseline='middle';
-    // Zone de texte : PAD de chaque côté (pixels monde)
-    const textW=o.w-PAD*2;
-    const textH=o.h-PAD*2;
-    const lines=wrapText(o.label,textW);
-    const lh=LINE_H,th=lines.length*lh;
-    // Centrer verticalement dans la zone de texte
-    const sy=o.y+PAD+(textH-th)/2+lh/2;
-    ctx.save();
-    // Clip exactement sur la zone de texte
-    ctx.beginPath();
-    ctx.rect(o.x+PAD,o.y+PAD,textW,textH);
-    ctx.clip();
+    const tw2=o.w-PAD*2,th2=o.h-PAD*2;
+    const lines=wrapText(o.label,tw2),lh=LINE_H,tot=lines.length*lh;
+    const sy=o.y+PAD+(th2-tot)/2+lh/2;
+    ctx.save();ctx.beginPath();ctx.rect(o.x+PAD,o.y+PAD,tw2,th2);ctx.clip();
     lines.forEach((l,i)=>ctx.fillText(l,o.x+o.w/2,sy+i*lh));
     ctx.restore();
-    // Char counter quand sélectionné
     if(sel){{
-      const cnt=o.label.length;
-      const cap=maxCharsForRect(o.w,o.h);
-      ctx.save();
-      ctx.font=(9/sc)+'px DM Mono,monospace';
+      const cnt=o.label.length,cap=maxChars(o.w,o.h);
+      ctx.font=(8/sc)+'px DM Mono,monospace';
       ctx.fillStyle=cnt>=cap?'#c0392b':'rgba(122,158,136,.75)';
       ctx.textAlign='center';ctx.textBaseline='top';
       ctx.fillText(cnt+'/'+cap,o.x+o.w/2,o.y+o.h+2/sc);
-      ctx.restore();
     }}
     ctx.restore();
   }}
-  // Handles
   if(sel&&!editing){{
     ctx.save();
     handles(o).forEach(h=>{{
@@ -1430,240 +1343,106 @@ function drawRect(o){{
 function drawArrow(o){{
   const sel=(o.id===selId);
   const ang=Math.atan2(o.y2-o.y1,o.x2-o.x1);
-  const AH=16/sc;
-  const ex=o.x2-Math.cos(ang)*AH*.6,ey=o.y2-Math.sin(ang)*AH*.6;
+  const AH=18/sc;
+  // Ligne raccourcie pour laisser place à la pointe
+  const ex=o.x2-Math.cos(ang)*AH*.7,ey=o.y2-Math.sin(ang)*AH*.7;
   ctx.save();
-  const g=ctx.createLinearGradient(o.x1,o.y1,o.x2,o.y2);
-  g.addColorStop(0,sel?'#7ab88a':'#a8c8b0');
-  g.addColorStop(1,sel?'#4a7c59':'#6a9e7a');
-  ctx.strokeStyle=g;ctx.lineWidth=3/sc;ctx.lineCap='round';
+  ctx.strokeStyle=sel?'#3a6246':'#5a8c6a';ctx.lineWidth=(sel?3:2.5)/sc;ctx.lineCap='round';
   ctx.beginPath();ctx.moveTo(o.x1,o.y1);ctx.lineTo(ex,ey);ctx.stroke();
-  ctx.fillStyle=sel?'#3a6246':'#5a8c6a';
+  // Pointe triangle solide
+  ctx.fillStyle=sel?'#2d4f38':'#4a7c59';
   ctx.beginPath();
   ctx.moveTo(o.x2,o.y2);
-  ctx.lineTo(o.x2-AH*Math.cos(ang-.42),o.y2-AH*Math.sin(ang-.42));
+  ctx.lineTo(o.x2-AH*Math.cos(ang-.45),o.y2-AH*Math.sin(ang-.45));
   ctx.lineTo(o.x2-AH*.5*Math.cos(ang),o.y2-AH*.5*Math.sin(ang));
-  ctx.lineTo(o.x2-AH*Math.cos(ang+.42),o.y2-AH*Math.sin(ang+.42));
+  ctx.lineTo(o.x2-AH*Math.cos(ang+.45),o.y2-AH*Math.sin(ang+.45));
   ctx.closePath();ctx.fill();
   if(sel){{
-    const mx=(o.x1+o.x2)/2,my=(o.y1+o.y2)/2;
-    ctx.fillStyle='rgba(74,124,89,.15)';
-    ctx.beginPath();ctx.arc(mx,my,7/sc,0,Math.PI*2);ctx.fill();
+    ctx.fillStyle='rgba(74,124,89,.2)';
+    ctx.beginPath();ctx.arc((o.x1+o.x2)/2,(o.y1+o.y2)/2,8/sc,0,Math.PI*2);ctx.fill();
   }}
   ctx.restore();
 }}
 
-function rrPath(x,y,w,h,r){{
+function rrP(x,y,w,h,r){{
   if(w<0){{x+=w;w=-w;}}if(h<0){{y+=h;h=-h;}}r=Math.min(r,w/2,h/2);
-  ctx.moveTo(x+r,y);ctx.lineTo(x+w-r,y);ctx.quadraticCurveTo(x+w,y,x+w,y+r);
+  ctx.beginPath();ctx.moveTo(x+r,y);ctx.lineTo(x+w-r,y);ctx.quadraticCurveTo(x+w,y,x+w,y+r);
   ctx.lineTo(x+w,y+h-r);ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h);
   ctx.lineTo(x+r,y+h);ctx.quadraticCurveTo(x,y+h,x,y+h-r);
   ctx.lineTo(x,y+r);ctx.quadraticCurveTo(x,y,x+r,y);ctx.closePath();
 }}
-// Canvas de mesure hors-écran : jamais transformé, toujours à sc=1
-const _mCtx=(()=>{{const c=document.createElement('canvas');c.width=1;c.height=1;
-  const x=c.getContext('2d');x.font='13px DM Mono,monospace';return x;}})();
 
-// Mesure un texte en pixels CSS réels (indépendant du zoom canvas)
-function measureW(text){{
-  _mCtx.font='13px DM Mono,monospace';
-  return _mCtx.measureText(text).width;
-}}
-
-// Wrap texte : maxW en pixels monde (coordonnées canvas).
-// On convertit en pixels CSS via sc pour la mesure.
-// wrapText : maxW en pixels monde (= pixels CSS à sc=1, mesurés par _mCtx)
-// measureW() utilise le canvas hors-écran à sc=1 donc retourne des pixels monde.
-// Pas de multiplication par sc nécessaire.
-function wrapText(text,maxW){{
-  if(!text)return[''];
-  const words=text.split(' ');const lines=[];let line='';
-  for(const w of words){{
-    const t=line?line+' '+w:w;
-    if(measureW(t)>maxW&&line){{lines.push(line);line=w;}}
-    else line=t;
-  }}
-  // Wrap des mots trop longs sans espace
-  const all=line?[...lines,line]:lines;
-  const result=[];
-  for(const ln of all){{
-    if(measureW(ln)<=maxW){{result.push(ln);continue;}}
-    let cur='';
-    for(const ch of ln){{
-      if(measureW(cur+ch)>maxW&&cur){{result.push(cur);cur=ch;}}
-      else cur+=ch;
-    }}
-    if(cur)result.push(cur);
-  }}
-  return result.length?result:[''];
-}}
-
-// Constantes de mise en page (en pixels monde, indépendantes du zoom)
-const PAD=20;          // padding intérieur de chaque côté
-const CHAR_W_PX=6.0;   // DM Mono 13px : ~7.5px réel × 0.80 sécurité
-const LINE_H=20;       // 13px × 1.5 arrondi
-
-// Limite de caractères pour un rectangle de taille w×h (pixels monde).
-function maxCharsForRect(w,h){{
-  const cols=Math.max(1,Math.floor((w-PAD*2)/CHAR_W_PX));
-  const rows=Math.max(1,Math.floor((h-PAD*2)/LINE_H));
-  return Math.max(4,Math.floor(cols*rows));
-}}
-
-// ── Textarea editor ────────────────────────────────────────────────────────
-function repositionTE(o){{
+// Textarea editor
+function reposTE(o){{
   const cx=o.x*sc+ox,cy=o.y*sc+oy;
-  const wPx=o.w*sc, hPx=o.h*sc;
-  const padPx=PAD*sc;
   te.style.left=cx+'px';te.style.top=cy+'px';
-  te.style.width=wPx+'px';te.style.height=hPx+'px';
-  // Police et padding scalés pour que le textarea reflète exactement le canvas
-  te.style.fontSize=(13*sc)+'px';
-  te.style.lineHeight=(LINE_H*sc)+'px';
-  te.style.padding=padPx+'px';
-  te.style.boxSizing='border-box';
-  te.style.wordBreak='break-word';
-  te.style.whiteSpace='pre-wrap';
-  te.style.overflowWrap='break-word';
-  te.style.textAlign='center';
-  te.style.overflow='hidden';
-  // Limite dynamique
-  const cap=maxCharsForRect(o.w,o.h);
-  te.maxLength=cap;
-  const cnt=te.value.length;
-  cc.style.left=cx+'px';cc.style.top=(cy+hPx+3)+'px';
-  cc.style.width=wPx+'px';
-  cc.style.color=cnt>=cap?'#c0392b':'#7a9e88';
-  cc.textContent=cnt+'/'+cap;
+  te.style.width=(o.w*sc)+'px';te.style.height=(o.h*sc)+'px';
+  te.style.fontSize=(13*sc)+'px';te.style.lineHeight=(LINE_H*sc)+'px';
+  te.style.padding=(PAD*sc)+'px';te.style.boxSizing='border-box';
+  te.style.wordBreak='break-word';te.style.whiteSpace='pre-wrap';
+  te.style.overflowWrap='break-word';te.style.textAlign='center';te.style.overflow='hidden';
+  te.maxLength=maxChars(o.w,o.h);
+  const cnt=te.value.length,cap=maxChars(o.w,o.h);
+  cc.style.left=cx+'px';cc.style.top=(cy+o.h*sc+2)+'px';cc.style.width=(o.w*sc)+'px';
+  cc.style.color=cnt>=cap?'#c0392b':'#7a9e88';cc.textContent=cnt+'/'+cap;
 }}
 function openTE(o){{
-  if(o.w2)return;  // not writable
-  eid=o.id;
-  const cap=maxCharsForRect(o.w,o.h);
-  te.value=o.label||'';
-  te.maxLength=cap;  // Limite dynamique selon taille de la forme
-  te.style.display='block';
-  cc.style.display='block';
-  repositionTE(o);
-  te.focus();
-  const l=te.value.length;te.setSelectionRange(l,l);
-  render();
+  if(o.w2)return;eid=o.id;te.value=o.label||'';
+  te.style.display='block';cc.style.display='block';
+  reposTE(o);te.focus();const l=te.value.length;te.setSelectionRange(l,l);render();
 }}
 function closeTE(){{
-  if(eid===null)return;
-  const o=objs.find(x=>x.id===eid);
-  if(o)o.label=te.value;
-  eid=null;
-  te.style.display='none';
-  cc.style.display='none';
-  render();
+  if(eid===null)return;const o=objs.find(x=>x.id===eid);if(o)o.label=te.value;
+  eid=null;te.style.display='none';cc.style.display='none';render();saveNow(false);
 }}
-te.addEventListener('input',()=>{{
-  const o=objs.find(x=>x.id===eid);
-  if(o){{o.label=te.value;repositionTE(o);render();}}
-}});
-// Never close on blur — only on explicit Escape or canvas click outside
+te.addEventListener('input',()=>{{const o=objs.find(x=>x.id===eid);if(o){{o.label=te.value;reposTE(o);render();saveNow(false);}}}});
 te.addEventListener('blur',()=>{{}});
-te.addEventListener('keydown',e=>{{
-  if(e.key==='Escape')closeTE();
-  e.stopPropagation();
-}});
+te.addEventListener('keydown',e=>{{if(e.key==='Escape')closeTE();e.stopPropagation();}});
 
-// ── Tool switching ─────────────────────────────────────────────────────────
+// Tools
 function setTool(t){{
   tool=t;asrc=null;ah.style.display='none';drawing=false;
-  ['bs','br','ba'].forEach(id=>document.getElementById(id).classList.remove('on'));
-  const bid=document.getElementById('b'+t);if(bid)bid.classList.add('on');
-  const curs={{s:'default',r:'crosshair',a:'crosshair'}};
-  cv.style.cursor=curs[t]||'default';
-  const hints={{
-    s:'Clic: sél | 2e clic: écrire | Drag: déplacer | Alt+drag: pan',
-    r:'Glisser pour créer un rectangle | Clic existant: sélectionner',
-    a:'Clic source → clic cible',
-  }};
-  hintEl.textContent=hints[t]||'';
+  ['bs','br','ba'].forEach(id=>document.getElementById(id)?.classList.remove('on'));
+  const b=document.getElementById('b'+t);if(b)b.classList.add('on');
+  cv.style.cursor=t==='s'?'default':'crosshair';
+  const H={{s:'Clic: sélect | 2e clic: écrire | Drag: déplacer | Alt+drag: pan',
+            r:'Glisser: créer | Clic existant: sélect',a:'Clic source puis cible'}};
+  hintEl.textContent=H[t]||'';
 }}
 
-// ── Mouse events ───────────────────────────────────────────────────────────
+// Mouse
 cv.addEventListener('mousedown',e=>{{
-  e.preventDefault();
-  const cp=gp(e),wp=tw(cp.x,cp.y);
-
-  // Alt + drag = pan (toujours)
+  e.preventDefault();const cp=gp(e),wp=tw(cp.x,cp.y);
   if(e.altKey||e.button===1){{
-    // Close editor first if clicking outside
-    if(eid!==null){{
-      const eo=objs.find(x=>x.id===eid);
-      if(!eo||!inRect(eo,wp.x,wp.y))closeTE();
-    }}
-    pan=true;panX=cp.x;panY=cp.y;panOX=ox;panOY=oy;
-    cv.style.cursor='grabbing';return;
+    if(eid!==null){{const eo=objs.find(x=>x.id===eid);if(!eo||!inRect(eo,wp.x,wp.y))closeTE();}}
+    pan=true;panX=cp.x;panY=cp.y;panOX=ox;panOY=oy;cv.style.cursor='grabbing';return;
   }}
   if(e.button!==0)return;
-
-  // Si éditeur ouvert, clic hors de la forme = fermer éditeur
-  if(eid!==null){{
-    const eo=objs.find(x=>x.id===eid);
-    if(eo&&inRect(eo,wp.x,wp.y)){{
-      // Clic DANS la forme en cours d'édition → laisser le textarea gérer
-      return;
-    }}
-    closeTE();
-    // Continue le traitement du clic
-  }}
-
+  if(eid!==null){{const eo=objs.find(x=>x.id===eid);if(eo&&inRect(eo,wp.x,wp.y))return;closeTE();}}
   if(tool==='s'){{
-    // Resize handles d'abord
     const sel=selId?objs.find(o=>o.id===selId):null;
-    if(sel&&sel.type==='r'){{
-      const h=hitHandle(sel,wp.x,wp.y);
-      if(h){{pushU();rsz=true;rh=h;dsx=wp.x;dsy=wp.y;rs={{x:sel.x,y:sel.y,w:sel.w,h:sel.h}};return;}}
-    }}
+    if(sel&&sel.type==='r'){{const h=hitHandle(sel,wp.x,wp.y);if(h){{pushU();rsz=true;rh=h;dsx=wp.x;dsy=wp.y;rs={{x:sel.x,y:sel.y,w:sel.w,h:sel.h}};return;}}}}
     const hit=hitAny(wp.x,wp.y);
     if(hit){{
-      if(hit.type==='r'){{
-        if(selId===hit.id){{
-          // 2e clic sur même objet → ouvrir éditeur
-          openTE(hit);return;
-        }}
-        pushU();selId=hit.id;updateWBtn();
-        drag=true;dsx=wp.x;dsy=wp.y;dox=hit.x;doy=hit.y;
-      }}else{{
-        selId=hit.id;updateWBtn();
-      }}
-    }}else{{
-      // Clic zone vide = déselectionner seulement (PAS de pan ici)
-      selId=null;updateWBtn();
-    }}
+      if(hit.type==='r'){{if(selId===hit.id){{openTE(hit);return;}}pushU();selId=hit.id;drag=true;dsx=wp.x;dsy=wp.y;dox=hit.x;doy=hit.y;}}
+      else{{selId=hit.id;}}
+    }}else{{selId=null;}}
     render();
-
   }}else if(tool==='r'){{
     const hit=hitAny(wp.x,wp.y);
-    if(hit){{
-      // Clic sur objet existant en mode rect → sélectionner et basculer
-      selId=hit.id;updateWBtn();setTool('s');
-      if(hit.type==='r')openTE(hit);
-      render();return;
-    }}
-    // Commencer à dessiner un rectangle
-    drawing=true;drawSt={{x:wp.x,y:wp.y}};drawEnd={{x:wp.x,y:wp.y}};
-
+    if(hit){{selId=hit.id;setTool('s');if(hit.type==='r')openTE(hit);render();return;}}
+    drawing=true;dSt={{x:wp.x,y:wp.y}};dEnd={{x:wp.x,y:wp.y}};
   }}else if(tool==='a'){{
+    const hitA=hitAny(wp.x,wp.y);
+    if(hitA&&hitA.type==='a'){{selId=hitA.id;render();return;}}
     const hit=hitRect(wp.x,wp.y);
     if(!hit){{asrc=null;ah.style.display='none';return;}}
-    if(!asrc){{
-      asrc=hit.id;selId=hit.id;updateWBtn();
-      ah.style.display='block';render();
-    }}else if(asrc!==hit.id){{
-      pushU();
-      const src=objs.find(o=>o.id===asrc);
-      objs.push({{
-        id:'a'+(idc++),type:'a',
-        x1:src.x+src.w/2,y1:src.y+src.h/2,
-        x2:hit.x+hit.w/2,y2:hit.y+hit.h/2,
-        srcId:asrc,dstId:hit.id,label:'',
-      }});
-      asrc=null;ah.style.display='none';render();
+    if(!asrc){{asrc=hit.id;selId=hit.id;ah.style.display='block';render();}}
+    else if(asrc!==hit.id){{
+      pushU();const src=objs.find(o=>o.id===asrc);
+      objs.push({{id:'a'+(idc++),type:'a',x1:src.x+src.w/2,y1:src.y+src.h/2,
+        x2:hit.x+hit.w/2,y2:hit.y+hit.h/2,srcId:asrc,dstId:hit.id,label:'',w2:false}});
+      asrc=null;ah.style.display='none';render();saveNow(false);
     }}
   }}
 }});
@@ -1671,163 +1450,64 @@ cv.addEventListener('mousedown',e=>{{
 cv.addEventListener('mousemove',e=>{{
   const cp=gp(e),wp=tw(cp.x,cp.y);
   if(pan){{ox=panOX+(cp.x-panX);oy=panOY+(cp.y-panY);render();return;}}
-  if(drag&&selId){{
-    const o=objs.find(x=>x.id===selId);
-    if(o&&o.type==='r'){{
-      o.x=dox+(wp.x-dsx);o.y=doy+(wp.y-dsy);
-      syncArrows(o);render();
-    }}
-  }}
+  if(drag&&selId){{const o=objs.find(x=>x.id===selId);if(o&&o.type==='r'){{o.x=dox+(wp.x-dsx);o.y=doy+(wp.y-dsy);syncArrows(o);render();}}}}
   if(rsz&&selId){{
-    const o=objs.find(x=>x.id===selId);
-    if(o){{
+    const o=objs.find(x=>x.id===selId);if(o){{
       const dx=wp.x-dsx,dy=wp.y-dsy;
-      if(rh.includes('e')){{
-        o.w=Math.max(MIN_RECT_W,rs.w+dx);
-        const mh=minH_forWidth(o.label||'',o.w);
-        if(o.h<mh)o.h=mh;
-      }}
-      if(rh.includes('w')){{
-        const nw=Math.max(MIN_RECT_W,rs.w-dx);
-        o.x=rs.x+(rs.w-nw);o.w=nw;
-        const mh=minH_forWidth(o.label||'',o.w);
-        if(o.h<mh)o.h=mh;
-      }}
-      if(rh.includes('s')){{
-        o.h=Math.max(minH_forWidth(o.label||'',o.w),rs.h+dy);
-      }}
-      if(rh.includes('n')){{
-        const mh=minH_forWidth(o.label||'',o.w);
-        const nh=Math.max(mh,rs.h-dy);
-        o.y=rs.y+(rs.h-nh);o.h=nh;
-      }}
-      syncArrows(o);
-      if(eid===o.id)repositionTE(o);
-      render();
+      if(rh.includes('e')){{o.w=Math.max(MIN_W,rs.w+dx);const mh=minHforW(o.label||'',o.w);if(o.h<mh)o.h=mh;}}
+      if(rh.includes('w')){{const nw=Math.max(MIN_W,rs.w-dx);o.x=rs.x+(rs.w-nw);o.w=nw;const mh=minHforW(o.label||'',o.w);if(o.h<mh)o.h=mh;}}
+      if(rh.includes('s')){{o.h=Math.max(minHforW(o.label||'',o.w),rs.h+dy);}}
+      if(rh.includes('n')){{const mh=minHforW(o.label||'',o.w);const nh=Math.max(mh,rs.h-dy);o.y=rs.y+(rs.h-nh);o.h=nh;}}
+      syncArrows(o);if(eid===o.id)reposTE(o);render();
     }}
   }}
-  if(drawing){{drawEnd={{x:wp.x,y:wp.y}};render();}}
+  if(drawing){{dEnd={{x:wp.x,y:wp.y}};render();}}
 }});
 
 cv.addEventListener('mouseup',e=>{{
   cv.style.cursor=tool==='s'?'default':'crosshair';
   if(pan){{pan=false;return;}}
   if(drawing){{
-    drawing=false;
-    const w=drawEnd.x-drawSt.x,h=drawEnd.y-drawSt.y;
+    drawing=false;const w=dEnd.x-dSt.x,h=dEnd.y-dSt.y;
     if(Math.abs(w)>15&&Math.abs(h)>12){{
-      pushU();
-      const o={{
-        id:'r'+(idc++),type:'r',
-        x:w>0?drawSt.x:drawSt.x+w,
-        y:h>0?drawSt.y:drawSt.y+h,
-        w:Math.abs(w),h:Math.abs(h),
-        label:'',w2:false,
-      }};
-      objs.push(o);selId=o.id;updateWBtn();
-      render();
-      setTool('s');
-      openTE(o);  // Ouvrir directement l'éditeur après création
-    }}else{{
-      render();
-    }}
+      pushU();const o={{id:'r'+(idc++),type:'r',
+        x:w>0?dSt.x:dSt.x+w,y:h>0?dSt.y:dSt.y+h,
+        w:Math.abs(w),h:Math.abs(h),label:'',w2:false}};
+      objs.push(o);selId=o.id;render();setTool('s');openTE(o);saveNow(false);
+    }}else render();
   }}
-  if(drag){{drag=false;}}
-  if(rsz){{rsz=false;}}
+  if(drag){{drag=false;saveNow(false);}}
+  if(rsz){{rsz=false;saveNow(false);}}
 }});
 
-// Frappe clavier directe sur objet sélectionné
 document.addEventListener('keydown',e=>{{
   if(e.target!==document.body)return;
   if(e.key==='Delete'||e.key==='Backspace'){{delSel();return;}}
-  if(e.key==='Escape'){{
-    if(eid!==null)closeTE();
-    else{{selId=null;updateWBtn();render();}}
-    return;
-  }}
-  if(e.key==='z'&&(e.ctrlKey||e.metaKey)&&!e.shiftKey){{doUndo();return;}}
-  if(e.key==='y'&&(e.ctrlKey||e.metaKey)){{doRedo();return;}}
-  if(e.key==='z'&&(e.ctrlKey||e.metaKey)&&e.shiftKey){{doRedo();return;}}
-  // Frappe directe → ouvrir éditeur et ajouter caractère
+  if(e.key==='Escape'){{if(eid!==null)closeTE();else{{selId=null;render();}};return;}}
+  if(e.ctrlKey||e.metaKey){{if(e.key==='z'&&!e.shiftKey){{doUndo();return;}}if(e.key==='z'&&e.shiftKey||e.key==='y'){{doRedo();return;}}}}
   if(selId&&e.key.length===1&&!e.ctrlKey&&!e.metaKey){{
     const o=objs.find(x=>x.id===selId);
     if(o&&o.type==='r'&&!o.w2){{
-      if((o.label||'').length>=maxCharsForRect(o.w,o.h))return;
-      openTE(o);
-      te.value=(o.label||'')+e.key;
-      o.label=te.value;
-      const l=te.value.length;te.setSelectionRange(l,l);
-      repositionTE(o);render();
+      if((o.label||'').length>=maxChars(o.w,o.h))return;
+      openTE(o);te.value=(o.label||'')+e.key;o.label=te.value;
+      const l=te.value.length;te.setSelectionRange(l,l);reposTE(o);render();
     }}
   }}
 }});
 
-// Zoom
 cv.addEventListener('wheel',e=>{{
-  e.preventDefault();
-  const cp=gp(e),d=e.deltaY<0?.12:-.12;
+  e.preventDefault();const cp=gp(e),d=e.deltaY<0?.12:-.12;
   const ns=Math.max(.08,Math.min(6,sc+d));
-  ox=cp.x-(cp.x-ox)*(ns/sc);oy=cp.y-(cp.y-oy)*(ns/sc);
-  sc=ns;render();
+  ox=cp.x-(cp.x-ox)*(ns/sc);oy=cp.y-(cp.y-oy)*(ns/sc);sc=ns;render();
 }},{{passive:false}});
 
-function zoom(d){{
-  const cx=cv.width/2,cy=cv.height/2;
-  const ns=Math.max(.08,Math.min(6,sc+d));
-  ox=cx-(cx-ox)*(ns/sc);oy=cy-(cy-oy)*(ns/sc);
-  sc=ns;render();
-}}
+function zoom(d){{const cx=cv.width/2,cy=cv.height/2;const ns=Math.max(.08,Math.min(6,sc+d));ox=cx-(cx-ox)*(ns/sc);oy=cy-(cy-oy)*(ns/sc);sc=ns;render();}}
 function resetView(){{sc=1;ox=60;oy=60;render();}}
-
-function delSel(){{
-  if(!selId)return;
-  if(eid!==null)closeTE();
-  pushU();
-  objs=objs.filter(o=>o.id!==selId&&o.srcId!==selId&&o.dstId!==selId);
-  selId=null;updateWBtn();render();
-}}
-
-function syncArrows(rect){{
-  objs.filter(o=>o.type==='a').forEach(a=>{{
-    const s=objs.find(x=>x.id===a.srcId);
-    const d=objs.find(x=>x.id===a.dstId);
-    if(s){{a.x1=s.x+s.w/2;a.y1=s.y+s.h/2;}}
-    if(d){{a.x2=d.x+d.w/2;a.y2=d.y+d.h/2;}}
-  }});
-}}
-
-// ── Export ─────────────────────────────────────────────────────────────────
-function exportData(){{
-  if(eid!==null)closeTE();
-  const rows=objs.map(o=>{{
-    let coords={{}};
-    if(o.type==='r')coords={{x:o.x,y:o.y,w:o.w,h:o.h}};
-    else if(o.type==='a')coords={{x1:o.x1,y1:o.y1,x2:o.x2,y2:o.y2,srcId:o.srcId,dstId:o.dstId}};
-    return{{
-      object_id:o.id,
-      type:o.type==='r'?'rectangle':'arrow',
-      label:o.label||'',
-      coords:JSON.stringify(coords),
-      writable:o.w2?'false':'true',
-    }};
-  }});
-  const payload=JSON.stringify({{fid:FID,loc:LOC,rows}});
-  dataOut.value=payload;
-  // Essayer postMessage vers parent Streamlit
-  try{{window.parent.postMessage({{mapdata:payload}},'*');}}catch(_){{}}
-  stEl.textContent='✓ Prêt';setTimeout(()=>stEl.textContent='',3000);
-  // Sauvegarder aussi dans sessionStorage comme backup
-  try{{sessionStorage.setItem('map_'+FID,payload);}}catch(_){{}}
-}}
-
-// Auto-export initial
-window.getMapData=function(){{
-  exportData();return dataOut.value;
-}};
+function delSel(){{if(!selId)return;if(eid!==null)closeTE();pushU();objs=objs.filter(o=>o.id!==selId&&o.srcId!==selId&&o.dstId!==selId);selId=null;render();saveNow(false);}}
+function syncArrows(rect){{objs.filter(o=>o.type==='a').forEach(a=>{{const s=objs.find(x=>x.id===a.srcId),d=objs.find(x=>x.id===a.dstId);if(s){{a.x1=s.x+s.w/2;a.y1=s.y+s.h/2;}}if(d){{a.x2=d.x+d.w/2;a.y2=d.y+d.h/2;}}}});}}
 
 render();
 </script></body></html>"""
-
 
 def render_map():
     ds = get_ds()
