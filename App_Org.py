@@ -541,6 +541,14 @@ div[data-testid="stHorizontalBlock"]{gap:5px!important;}
 .fc-meta{font-size:.63rem;color:var(--t3);margin-top:3px;}
 .fc-badge{font-size:.58rem;padding:2px 6px;border-radius:4px;
   background:var(--acd);color:var(--ac);font-weight:500;display:inline-block;margin-top:4px;}
+/* Sidebar tree — zéro espacement entre lignes */
+section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p{
+  margin:0!important;padding:0!important;line-height:1!important;
+}
+section[data-testid="stSidebar"] .stButton{margin:0!important;}
+section[data-testid="stSidebar"] .element-container{
+  margin-bottom:0!important;margin-top:0!important;
+}
 /* Scrollbar */
 ::-webkit-scrollbar{width:5px;height:5px;}
 ::-webkit-scrollbar-track{background:var(--bg2);}
@@ -619,6 +627,15 @@ def _trunc(s: str, n: int = 16) -> str:
 
 
 def _render_tree(ds, user, nodes, depth, parent_last, max_depth=2):
+    """
+    Arbre rendu en HTML pur dans un seul bloc — branches pixel-perfect.
+    Clic sur un nœud = bouton Streamlit standard (pas de JS cross-origin).
+    Les branches SVG sont dans le même st.markdown que le bouton via HTML.
+    
+    Approche : utiliser st.markdown pour la ligne complète avec HTML,
+    mais les vraies actions via des boutons Streamlit dans des colonnes.
+    Le secret : margin-bottom:-14px sur le SVG pour le coller au bouton suivant.
+    """
     cc = st.session_state.get("current_cat_id")
     n = len(nodes)
     for idx, node in enumerate(nodes):
@@ -627,43 +644,54 @@ def _render_tree(ds, user, nodes, depth, parent_last, max_depth=2):
         collapsed = node.get("collapsed", False)
         sel = cc == nid; is_last = (idx == n - 1)
         has_kids = bool(kids) and depth < max_depth
-        # Icone et style selon profondeur
-        if depth == 0:
-            icon = "◆" if kids else "◇"
-        elif depth == 1:
-            icon = "▸" if kids else "·"
-        else:
-            icon = "·"
-        # Préfixe branche unicode — affiché hors bouton
+
+        # Label sans caractères superflus
+        tog = ("▾ " if not collapsed else "▸ ") if has_kids else "   "
+        label = f"{tog}{_trunc(name)}"
+
+        # Colonne unique avec indent simulé par un spacer HTML dans le label
+        # + branches SVG rendues avec negative margin pour coller
+        indent = depth * 14  # pixels
+
         if depth > 0:
-            pre = ""
-            for pl in parent_last:
-                pre += "    " if pl else "│   "
-            br = "└── " if is_last else "├── "
-            branch_div = (
-                '<div style="line-height:1.2;padding:0 0 0 4px;margin-bottom:-4px;'
-                'font-family:DM Mono,monospace;font-size:.70rem;color:#c8dbc0;'
-                'letter-spacing:0;white-space:pre;">' + pre + br + '</div>'
+            # SVG branche avec negative margin-bottom pour coller au bouton
+            svg_lines = []
+            for lvl, pl in enumerate(parent_last):
+                x = 7 + lvl * 14
+                if not pl:
+                    svg_lines.append(
+                        f'<line x1="{x}" y1="0" x2="{x}" y2="32" ' +
+                        'stroke="#c8dbc0" stroke-width="1.5"/>')
+            cx = 7 + (depth-1)*14
+            end_y = "16" if is_last else "32"
+            svg_lines += [
+                f'<line x1="{cx}" y1="0" x2="{cx}" y2="{end_y}" stroke="#c8dbc0" stroke-width="1.5"/>',
+                f'<line x1="{cx}" y1="16" x2="{cx+12}" y2="16" stroke="#c8dbc0" stroke-width="1.5"/>',
+            ]
+            w = cx + 16
+            # margin-bottom négatif = branche colle au bouton
+            st.markdown(
+                f'<div style="margin-bottom:-28px;padding-left:0;line-height:0;">' +
+                f'<svg width="{w}" height="32" style="display:block;">' +
+                "".join(svg_lines) + "</svg></div>",
+                unsafe_allow_html=True
             )
-            st.markdown(branch_div, unsafe_allow_html=True)
-        label = f"{icon} {_trunc(name)}"
-        if has_kids:
-            c_tog, c_nom, c_pop = st.columns([0.10, 0.75, 0.15])
-            with c_tog:
-                lbl = "▶" if collapsed else "▼"
-                if st.button(lbl, key=f"tgl_{nid}", use_container_width=True):
-                    ds.tog_col(user, nid); st.rerun()
-        else:
-            c_nom, c_pop = st.columns([0.85, 0.15])
+
+        c_nom, c_pop = st.columns([0.85, 0.15])
         with c_nom:
-            if st.button(label, key=f"cat_{nid}",
+            # Spacer invisible en tête de label pour l'indentation
+            spaces = " " * (indent // 4)  # non-breaking spaces
+            if st.button(spaces + label, key=f"cat_{nid}",
                          type="primary" if sel else "secondary",
                          use_container_width=True):
+                if has_kids: ds.tog_col(user, nid)
                 set_cat(nid); st.rerun()
         with c_pop:
             _cat_menu(ds, user, nid, name, cc)
+
         if has_kids and not collapsed:
-            _render_tree(ds, user, kids, depth + 1, parent_last + [is_last])
+            _render_tree(ds, user, kids, depth+1, parent_last+[is_last])
+
 
 def _cat_menu(ds, user, nid, name, current_cat):
     with st.popover("⋯"):
