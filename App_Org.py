@@ -1269,26 +1269,50 @@ function toggleAS(){{
   document.getElementById('btn_as').classList.toggle('on',autoSave);
   stEl.textContent=autoSave?'Auto ON':'Auto OFF';setTimeout(()=>stEl.textContent='',2000);
 }}
+function serializeObjs(){{
+  if(eid!==null){{const o=objs.find(x=>x.id===eid);if(o)o.label=te.value;}}
+  const rows=objs.map(o=>{{
+    let coords={{}};
+    if(o.type==='r')coords={{x:o.x,y:o.y,w:o.w,h:o.h}};
+    else coords={{x1:o.x1,y1:o.y1,x2:o.x2,y2:o.y2,srcId:o.srcId,dstId:o.dstId}};
+    return{{object_id:o.id,type:o.type==='r'?'rectangle':'arrow',
+            label:o.label||'',coords:JSON.stringify(coords),writable:o.w2?'false':'true'}};
+  }});
+  return JSON.stringify({{fid:FID,loc:LOC,rows,ts:Date.now()}});
+}}
+
 function saveNow(force){{
   if(!force&&!autoSave)return;
   clearTimeout(_saveTimer);
   _saveTimer=setTimeout(()=>{{
-    if(eid!==null){{const o=objs.find(x=>x.id===eid);if(o)o.label=te.value;}}
-    const rows=objs.map(o=>{{
-      let coords={{}};
-      if(o.type==='r')coords={{x:o.x,y:o.y,w:o.w,h:o.h}};
-      else coords={{x1:o.x1,y1:o.y1,x2:o.x2,y2:o.y2,srcId:o.srcId,dstId:o.dstId}};
-      return{{object_id:o.id,type:o.type==='r'?'rectangle':'arrow',
-              label:o.label||'',coords:JSON.stringify(coords),writable:o.w2?'false':'true'}};
-    }});
-    const payload=JSON.stringify({{fid:FID,loc:LOC,rows,ts:Date.now()}});
-    // Stocker dans localStorage — lu par le bridge Streamlit
+    const payload=serializeObjs();
+    // sessionStorage : accessible dans le même iframe, pas de cross-origin
+    try{{sessionStorage.setItem('map_data_'+FID,payload);}}catch(_){{}}
+    // Déclencher sauvegarde via query param : encoder en base64 et naviguer
     try{{
-      localStorage.setItem('streamlit_map_save',payload);
-      localStorage.setItem('streamlit_map_save_fid',FID);
-    }}catch(_){{}}
+      const b64=btoa(unescape(encodeURIComponent(payload)));
+      const url=new URL(window.parent.location.href);
+      url.searchParams.set('mapdata',b64);
+      window.parent.history.replaceState({{}},'',url.toString());
+      // Forcer Streamlit à lire le query param en simulant une navigation
+      window.parent.dispatchEvent(new Event('popstate'));
+    }}catch(e){{
+      // Si cross-origin bloqué, stocker pour sauvegarde manuelle
+    }}
     stEl.textContent='\u2713';setTimeout(()=>stEl.textContent='',1500);
   }},400);
+}}
+
+// Sauvegarde forcée immédiate (ex: avant fermeture)
+function saveImmediate(){{
+  const payload=serializeObjs();
+  try{{sessionStorage.setItem('map_data_'+FID,payload);}}catch(_){{}}
+  try{{
+    const b64=btoa(unescape(encodeURIComponent(payload)));
+    const url=new URL(window.parent.location.href);
+    url.searchParams.set('mapdata',b64);
+    window.parent.history.replaceState({{}},'',url.toString());
+  }}catch(e){{}}
 }}
 // Init autosave button state
 if(autoSave)document.getElementById('btn_as').classList.add('on');
@@ -1455,8 +1479,11 @@ cv.addEventListener('mousedown',e=>{{
     if(!asrc){{asrc=hit.id;selId=hit.id;ah.style.display='block';render();}}
     else if(asrc!==hit.id){{
       pushU();const src=objs.find(o=>o.id===asrc);
-      objs.push({{id:'a'+(idc++),type:'a',x1:src.x+src.w/2,y1:src.y+src.h/2,
-        x2:hit.x+hit.w/2,y2:hit.y+hit.h/2,srcId:asrc,dstId:hit.id,label:'',w2:false}});
+      const dcx=hit.x+hit.w/2,dcy=hit.y+hit.h/2;
+      const scx=src.x+src.w/2,scy=src.y+src.h/2;
+      const sp=edgePt(src,dcx,dcy),dp=edgePt(hit,scx,scy);
+      objs.push({{id:'a'+(idc++),type:'a',x1:sp.x,y1:sp.y,
+        x2:dp.x,y2:dp.y,srcId:asrc,dstId:hit.id,label:'',w2:false}});
       asrc=null;ah.style.display='none';render();saveNow(false);
     }}
   }}
@@ -1519,7 +1546,31 @@ cv.addEventListener('wheel',e=>{{
 function zoom(d){{const cx=cv.width/2,cy=cv.height/2;const ns=Math.max(.08,Math.min(6,sc+d));ox=cx-(cx-ox)*(ns/sc);oy=cy-(cy-oy)*(ns/sc);sc=ns;render();}}
 function resetView(){{sc=1;ox=60;oy=60;render();}}
 function delSel(){{if(!selId)return;if(eid!==null)closeTE();pushU();objs=objs.filter(o=>o.id!==selId&&o.srcId!==selId&&o.dstId!==selId);selId=null;render();saveNow(false);}}
-function syncArrows(rect){{objs.filter(o=>o.type==='a').forEach(a=>{{const s=objs.find(x=>x.id===a.srcId),d=objs.find(x=>x.id===a.dstId);if(s){{a.x1=s.x+s.w/2;a.y1=s.y+s.h/2;}}if(d){{a.x2=d.x+d.w/2;a.y2=d.y+d.h/2;}}}});}}
+// Calcule le point de sortie du bord d'un rectangle vers une cible (cx,cy)
+function edgePt(r,tx,ty){{
+  const cx=r.x+r.w/2,cy=r.y+r.h/2;
+  const dx=tx-cx,dy=ty-cy;
+  if(Math.abs(dx)<0.001&&Math.abs(dy)<0.001)return{{x:cx,y:cy}};
+  // Intersection avec les 4 bords
+  const hw=r.w/2,hh=r.h/2;
+  let t=Infinity;
+  if(Math.abs(dx)>0.001){{
+    const tx1=(dx>0?hw:-hw)/dx; if(tx1>0)t=Math.min(t,tx1);
+  }}
+  if(Math.abs(dy)>0.001){{
+    const ty1=(dy>0?hh:-hh)/dy; if(ty1>0)t=Math.min(t,ty1);
+  }}
+  return{{x:cx+dx*t,y:cy+dy*t}};
+}}
+function syncArrows(rect){{
+  objs.filter(o=>o.type==='a').forEach(a=>{{
+    const s=objs.find(x=>x.id===a.srcId),d=objs.find(x=>x.id===a.dstId);
+    const scx=s?s.x+s.w/2:a.x1,scy=s?s.y+s.h/2:a.y1;
+    const dcx=d?d.x+d.w/2:a.x2,dcy=d?d.y+d.h/2:a.y2;
+    if(s){{const p=edgePt(s,dcx,dcy);a.x1=p.x;a.y1=p.y;}}
+    if(d){{const p=edgePt(d,scx,scy);a.x2=p.x;a.y2=p.y;}}
+  }});
+}}
 
 render();
 </script></body></html>"""
@@ -1582,63 +1633,26 @@ def render_map():
             'Ctrl+Z/Y: undo/redo | 💾 Sauvegarder → coller ci-dessous</div>',
             unsafe_allow_html=True)
 
-    # ── Bridge localStorage → Streamlit ─────────────────────────────────────
-    # Le canvas écrit dans localStorage. Ce bridge polls et sauvegarde via R2.
-    bridge_html = f"""<script>
-    (function(){{
-      const KEY='streamlit_map_save', FIDK='streamlit_map_save_fid';
-      const TFID='{fid}'; let lastTs=null;
-      function inject(data){{
-        try{{
-          const inputs=window.parent.document.querySelectorAll('input[data-mapsink]');
-          if(!inputs.length)return false;
-          const inp=inputs[0];
-          const setter=Object.getOwnPropertyDescriptor(window.parent.HTMLInputElement.prototype,'value');
-          setter.set.call(inp,data);
-          inp.dispatchEvent(new Event('input',{{bubbles:true}}));
-          inp.dispatchEvent(new Event('change',{{bubbles:true}}));
-          return true;
-        }}catch(e){{return false;}}
-      }}
-      function tag(){{
-        const doc=window.parent.document;
-        const all=doc.querySelectorAll('input[type=text]');
-        all.forEach(inp=>{{
-          if(!inp.getAttribute('data-mapsink')&&inp.value===''&&inp.style.display!=='none')
-            inp.setAttribute('data-mapsink','1');
-        }});
-      }}
-      function poll(){{
-        tag();
-        try{{
-          if(localStorage.getItem(FIDK)!==TFID)return;
-          const raw=localStorage.getItem(KEY);if(!raw)return;
-          const d=JSON.parse(raw);if(d.ts===lastTs)return;
-          lastTs=d.ts;
-          if(inject(raw)){{localStorage.removeItem(KEY);localStorage.removeItem(FIDK);}}
-        }}catch(e){{}}
-      }}
-      setInterval(poll,300);
-    }})();
-    </script>"""
-    components.html(bridge_html, height=0)
-
-    def _on_map_input():
-        raw = st.session_state.get(f"mapsink_{fid}", "")
-        if not raw or not raw.strip().startswith("{"): return
+    # ── Sauvegarde via query_params ──────────────────────────────────────────
+    # Le canvas stocke les données dans sessionStorage.
+    # Quand l'utilisateur clique "Sauvegarder" ou "← Retour",
+    # le JS encode les données en base64 et redirige vers l'URL courante
+    # avec ?mapdata=<base64>. Streamlit détecte le query param et sauvegarde.
+    
+    # Lire les données de sauvegarde depuis query_params
+    raw_qp = st.query_params.get("mapdata", "")
+    if raw_qp:
         try:
-            p = json.loads(raw.strip())
-            if p.get("fid") == fid:
-                _save_map_from_payload(ds, fid, loc, p)
-                st.session_state[f"mapsink_{fid}"] = ""
+            import base64 as _b64
+            payload = json.loads(_b64.b64decode(raw_qp.encode()).decode())
+            if payload.get("fid") == fid:
+                _save_map_from_payload(ds, fid, loc, payload)
+                st.toast("Map sauvegardée ✓", icon="✅")
         except: pass
+        # Nettoyer le query param après traitement
+        st.query_params.clear()
 
-    st.text_input("", key=f"mapsink_{fid}",
-                  label_visibility="collapsed",
-                  on_change=_on_map_input,
-                  placeholder="map-data-sink")
-
-    # Canvas
+    # Canvas (avec sauvegarde intégrée)
     components.html(_build_map_html(objs_json, fid, loc), height=650, scrolling=False)
 
     st.markdown(
