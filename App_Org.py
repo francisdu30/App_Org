@@ -299,6 +299,27 @@ class DataStore:
 
     def dl_map(self, fid): r2_del(f"maps/{fid}.parquet")
 
+    def presigned_put(self, key: str, expires: int = 3600) -> str:
+        """Génère une URL presignée PUT R2 pour upload direct depuis le JS."""
+        try:
+            return get_r2().generate_presigned_url(
+                "put_object",
+                Params={"Bucket": _bkt(), "Key": key,
+                        "ContentType": "application/octet-stream"},
+                ExpiresIn=expires)
+        except Exception as e:
+            return ""
+
+    def presigned_get(self, key: str, expires: int = 3600) -> str:
+        """Génère une URL presignée GET R2."""
+        try:
+            return get_r2().generate_presigned_url(
+                "get_object",
+                Params={"Bucket": _bkt(), "Key": key},
+                ExpiresIn=expires)
+        except Exception as e:
+            return ""
+
     def get_backup_list(self) -> list[dict]:
         return self._get_backup_meta()
 
@@ -1117,8 +1138,9 @@ def _render_version_picker(ds: DataStore, fid: str, kind: str):
 # ══════════════════════════════════════════════════════════════════════════════
 MAX_CHARS = 500  # absolue max global; la limite réelle est calculée par forme
 
-def _build_map_html(objs_json: str, fid: str, loc: str, autosave: bool = True) -> str:
+def _build_map_html(objs_json: str, fid: str, loc: str, autosave: bool = True, put_url: str = "") -> str:
     as_js = "true" if autosave else "false"
+    safe_put_url = put_url.replace('"', '&quot;')
     return f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
 <style>
 *{{box-sizing:border-box;margin:0;padding:0;}}
@@ -1181,7 +1203,7 @@ const cv=document.getElementById('cv'),ctx=cv.getContext('2d');
 const cw=document.getElementById('cw'),te=document.getElementById('te');
 const cc=document.getElementById('cc'),ah=document.getElementById('ah');
 const stEl=document.getElementById('st'),hintEl=document.getElementById('hint');
-const FID="{fid}",LOC="{loc}";
+const FID="{fid}",LOC="{loc}",PUT_URL="{safe_put_url}";
 const PAD=20,LINE_H=20,MIN_W=60,MIN_H=40,CHAR_W=6.0;
 
 let objs={objs_json};
@@ -1281,41 +1303,38 @@ function serializeObjs(){{
   return JSON.stringify({{fid:FID,loc:LOC,rows,ts:Date.now()}});
 }}
 
+// Init autosave button state
+if(autoSave)document.getElementById('btn_as').classList.add('on');
+
+// ── Sauvegarde directe vers R2 via presigned URL ──────────────────────────
+// Pas de cross-origin, pas d'iframe restriction.
+// Le canvas fait un PUT HTTP directement vers R2 à chaque action.
+
 function saveNow(force){{
   if(!force&&!autoSave)return;
   clearTimeout(_saveTimer);
   _saveTimer=setTimeout(()=>{{
-    const payload=serializeObjs();
-    // sessionStorage : accessible dans le même iframe, pas de cross-origin
-    try{{sessionStorage.setItem('map_data_'+FID,payload);}}catch(_){{}}
-    // Déclencher sauvegarde via query param : encoder en base64 et naviguer
-    try{{
-      const b64=btoa(unescape(encodeURIComponent(payload)));
-      const url=new URL(window.parent.location.href);
-      url.searchParams.set('mapdata',b64);
-      window.parent.history.replaceState({{}},'',url.toString());
-      // Forcer Streamlit à lire le query param en simulant une navigation
-      window.parent.dispatchEvent(new Event('popstate'));
-    }}catch(e){{
-      // Si cross-origin bloqué, stocker pour sauvegarde manuelle
+    const jsonStr=serializeObjs();
+    if(!PUT_URL){{
+      // Pas de presigned URL : stocker en sessionStorage seulement
+      try{{sessionStorage.setItem('map_data_'+FID,jsonStr);}}catch(_){{}}
+      stEl.textContent='\u2753';setTimeout(()=>stEl.textContent='',2000);
+      return;
     }}
-    stEl.textContent='\u2713';setTimeout(()=>stEl.textContent='',1500);
-  }},400);
+    // Convertir JSON en Parquet simplifié = on envoie du JSON encodé
+    // R2 accepte n'importe quel binaire ; Python le lira comme JSON
+    const blob=new Blob([jsonStr],{{type:'application/json'}});
+    fetch(PUT_URL,{{method:'PUT',body:blob,
+      headers:{{'Content-Type':'application/octet-stream'}}
+    }})
+    .then(r=>{{
+      if(r.ok){{stEl.textContent='\u2713 Sauvé';}}
+      else{{stEl.textContent='\u26a0 Err '+r.status;}}
+      setTimeout(()=>stEl.textContent='',2000);
+    }})
+    .catch(e=>{{stEl.textContent='\u26a0';setTimeout(()=>stEl.textContent='',2000);}});
+  }},600);
 }}
-
-// Sauvegarde forcée immédiate (ex: avant fermeture)
-function saveImmediate(){{
-  const payload=serializeObjs();
-  try{{sessionStorage.setItem('map_data_'+FID,payload);}}catch(_){{}}
-  try{{
-    const b64=btoa(unescape(encodeURIComponent(payload)));
-    const url=new URL(window.parent.location.href);
-    url.searchParams.set('mapdata',b64);
-    window.parent.history.replaceState({{}},'',url.toString());
-  }}catch(e){{}}
-}}
-// Init autosave button state
-if(autoSave)document.getElementById('btn_as').classList.add('on');
 
 // Render
 function render(){{
@@ -1633,27 +1652,51 @@ def render_map():
             'Ctrl+Z/Y: undo/redo | 💾 Sauvegarder → coller ci-dessous</div>',
             unsafe_allow_html=True)
 
-    # ── Sauvegarde via query_params ──────────────────────────────────────────
-    # Le canvas stocke les données dans sessionStorage.
-    # Quand l'utilisateur clique "Sauvegarder" ou "← Retour",
-    # le JS encode les données en base64 et redirige vers l'URL courante
-    # avec ?mapdata=<base64>. Streamlit détecte le query param et sauvegarde.
+    # ── Sauvegarde directe R2 via presigned URL ──────────────────────────────
+    # Générer une presigned URL PUT valide 1h pour la clé JSON de la map.
+    # Le canvas fait un PUT fetch() directement vers R2 — pas de cross-origin.
+    # Python lit le fichier JSON à chaque chargement pour reconstruire la map.
+    json_key = f"maps/{fid}_live.json"
+    put_url = ds.presigned_put(json_key, expires=3600)
     
-    # Lire les données de sauvegarde depuis query_params
-    raw_qp = st.query_params.get("mapdata", "")
-    if raw_qp:
-        try:
-            import base64 as _b64
-            payload = json.loads(_b64.b64decode(raw_qp.encode()).decode())
-            if payload.get("fid") == fid:
-                _save_map_from_payload(ds, fid, loc, payload)
-                st.toast("Map sauvegardée ✓", icon="✅")
-        except: pass
-        # Nettoyer le query param après traitement
-        st.query_params.clear()
+    # Lire le JSON live si présent (données plus récentes que le parquet)
+    try:
+        live_df = r2_load(json_key, [])
+        # Le fichier JSON live contient les données brutes — le parser
+        obj_live = get_r2().get_object(Bucket=_bkt(), Key=json_key)
+        raw_live = obj_live["Body"].read().decode("utf-8")
+        payload_live = json.loads(raw_live)
+        if (payload_live.get("fid") == fid and 
+            payload_live.get("ts", 0) > st.session_state.get(f"map_ts_{fid}", 0)):
+            _save_map_from_payload(ds, fid, loc, payload_live)
+            st.session_state[f"map_ts_{fid}"] = payload_live.get("ts", 0)
+            # Reconstruire objs depuis le nouveau parquet
+            df2 = ds.ld_map(fid)
+            if df2 is not None:
+                objs2 = []
+                for _, row in df2.iterrows():
+                    t2 = str(row.get("type", ""))
+                    if t2 == "meta": continue
+                    coords2 = {}
+                    try: coords2 = json.loads(str(row.get("coords", "{}")))
+                    except: pass
+                    o2 = {"id": str(row["object_id"]), "type": "r" if t2=="rectangle" else "a",
+                          "label": str(row.get("label", "")),
+                          "w2": str(row.get("writable","true")).lower()=="false"}
+                    if t2=="rectangle":
+                        o2.update({"x":float(coords2.get("x",100)),"y":float(coords2.get("y",100)),
+                                   "w":float(coords2.get("w",180)),"h":float(coords2.get("h",100))})
+                    elif t2=="arrow":
+                        o2.update({"x1":float(coords2.get("x1",0)),"y1":float(coords2.get("y1",0)),
+                                   "x2":float(coords2.get("x2",100)),"y2":float(coords2.get("y2",100)),
+                                   "srcId":coords2.get("srcId"),"dstId":coords2.get("dstId")})
+                    objs2.append(o2)
+                objs_json = json.dumps(objs2, ensure_ascii=False)
+    except: pass
 
-    # Canvas (avec sauvegarde intégrée)
-    components.html(_build_map_html(objs_json, fid, loc), height=650, scrolling=False)
+    # Canvas
+    components.html(_build_map_html(objs_json, fid, loc, put_url=put_url),
+                    height=650, scrolling=False)
 
     st.markdown(
         '<div style="font-size:.65rem;color:var(--t3);margin-top:4px;">'
@@ -1675,6 +1718,7 @@ def _save_map_from_payload(ds: DataStore, fid: str, loc: str, payload: dict):
     }]
     for r in rows_in:
         t = r.get("type", "")
+        if not t: continue
         rows_out.append({
             "_location_": "",
             "object_id": str(r.get("object_id", "")),
@@ -1683,7 +1727,8 @@ def _save_map_from_payload(ds: DataStore, fid: str, loc: str, payload: dict):
             "coords": str(r.get("coords", "{}")),
             "writable": str(r.get("writable", "true")),
         })
-    ds.sv_map(fid, pd.DataFrame(rows_out))
+    if len(rows_out) > 1:  # ne sauvegarder que si il y a des objets
+        ds.sv_map(fid, pd.DataFrame(rows_out))
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  §11 — MAIN
