@@ -1148,7 +1148,8 @@ MAX_CHARS = 500  # absolue max global; la limite réelle est calculée par forme
 
 def _build_map_html(objs_json: str, fid: str, loc: str, autosave: bool = True, put_url: str = "") -> str:
     as_js = "true" if autosave else "false"
-    safe_put = put_url.replace('"', '%22')
+    import json as _json
+    safe_put = _json.dumps(put_url)  # encode proprement pour JS string
     return f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
 <style>
 *{{box-sizing:border-box;margin:0;padding:0;}}
@@ -1211,7 +1212,7 @@ const cv=document.getElementById('cv'),ctx=cv.getContext('2d');
 const cw=document.getElementById('cw'),te=document.getElementById('te');
 const cc=document.getElementById('cc'),ah=document.getElementById('ah');
 const stEl=document.getElementById('st'),hintEl=document.getElementById('hint');
-const FID="{fid}",LOC="{loc}";
+const FID="{fid}",LOC="{loc}",PUT_URL={safe_put};
 const PAD=20,LINE_H=20,MIN_W=60,MIN_H=40,CHAR_W=6.0;
 
 let objs={objs_json};
